@@ -1,0 +1,56 @@
+mode:
+  name: backtest
+
+paths:
+  data_dir: data
+  output_dir: runs
+
+symbols:
+  enabled: [XAUUSDm]
+  registry:
+    XAUUSDm:
+      asset_class: metal
+      magic: 7001
+      pip_size: 0.01
+      pip_value: 1.0
+      contract_size: 100
+      min_lot: 0.01
+      max_lot: 1.0
+      lot_step: 0.01
+      average_spread: 18
+      trading_session: "24x5"
+      broker_suffix: "m"
+
+risk:
+  risk_per_trade: 0.0025
+  daily_loss_limit: 0.01
+  weekly_loss_limit: 0.03
+  max_drawdown: 0.10
+  max_open_positions: 2
+  max_symbol_exposure: 1
+  max_lot: 0.10
+  kill_switch_behavior: HALT_NEW_TRADES
+
+signal:
+  strategy: atr_breakout
+  buy_threshold: 0.60
+  sell_threshold: 0.60
+  min_rr: 1.5
+
+filters:
+  max_spread_multiplier: 2.5
+  min_atr: 0.0
+
+backtest:
+  initial_equity: 10000
+  same_bar_policy: conservative
+  execute_signal_at: next_open
+  slippage_model: base
+  commission_per_lot: 0
+  spread_cost_multiplier: 1.0
+  time_stop_bars: 24
+
+shadow:
+  broker: mt5
+  send_orders: false
+  poll_seconds: 60

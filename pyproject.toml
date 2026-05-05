@@ -1,0 +1,14 @@
+[project]
+name = "algo-trade-core"
+version = "0.1.0"
+description = "Modular algorithmic trading core for MT5 CFD/FX backtest and shadow workflows."
+requires-python = ">=3.12"
+dependencies = [
+  "numpy",
+  "pandas",
+  "pyyaml",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
