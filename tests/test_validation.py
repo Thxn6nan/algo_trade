@@ -50,6 +50,38 @@ class DataValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid candles"):
             validate_ohlcv(frame)
 
+    def test_market_session_gap_can_be_allowed(self):
+        frame = pd.DataFrame(
+            [
+                ["2026-01-02T23:45:00", "XAUUSDm", "M15", 100, 101, 99, 100.5, 1000, 18],
+                ["2026-01-05T00:00:00", "XAUUSDm", "M15", 100.5, 101.5, 100, 101, 1000, 18],
+                ["2026-01-05T00:15:00", "XAUUSDm", "M15", 101, 102, 100.5, 101.5, 1000, 18],
+            ],
+            columns=["timestamp", "symbol", "timeframe", "open", "high", "low", "close", "volume", "spread"],
+        ).assign(timestamp=lambda data: pd.to_datetime(data["timestamp"]))
+
+        with self.assertRaisesRegex(ValueError, "Missing bars"):
+            validate_ohlcv(frame)
+
+        report = validate_ohlcv(frame, allow_session_gaps=True)
+        self.assertEqual(report.missing_bars, 0)
+
+    def test_intraday_maintenance_gap_can_be_allowed(self):
+        frame = pd.DataFrame(
+            [
+                ["2026-01-05T20:45:00", "XAUUSDm", "M15", 100, 101, 99, 100.5, 1000, 18],
+                ["2026-01-05T22:00:00", "XAUUSDm", "M15", 100.5, 101.5, 100, 101, 1000, 18],
+                ["2026-01-05T22:15:00", "XAUUSDm", "M15", 101, 102, 100.5, 101.5, 1000, 18],
+            ],
+            columns=["timestamp", "symbol", "timeframe", "open", "high", "low", "close", "volume", "spread"],
+        ).assign(timestamp=lambda data: pd.to_datetime(data["timestamp"]))
+
+        with self.assertRaisesRegex(ValueError, "Missing bars"):
+            validate_ohlcv(frame)
+
+        report = validate_ohlcv(frame, allow_session_gaps=True, max_session_gap_minutes=120)
+        self.assertEqual(report.missing_bars, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

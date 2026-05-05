@@ -25,7 +25,12 @@ class DataQualityReport:
         return self.__dict__.copy()
 
 
-def validate_ohlcv(frame: pd.DataFrame, missing_threshold: int = 0) -> DataQualityReport:
+def validate_ohlcv(
+    frame: pd.DataFrame,
+    missing_threshold: int = 0,
+    allow_session_gaps: bool = False,
+    max_session_gap_minutes: int = 180,
+) -> DataQualityReport:
     missing_columns = [column for column in REQUIRED_COLUMNS if column not in frame.columns]
     if missing_columns:
         raise ValueError(f"Missing OHLCV columns: {missing_columns}")
@@ -55,7 +60,11 @@ def validate_ohlcv(frame: pd.DataFrame, missing_threshold: int = 0) -> DataQuali
     if invalid_count:
         raise ValueError(f"Invalid candles found: {invalid_count}")
 
-    missing_bars = _count_missing_bars(timestamps)
+    missing_bars = _count_missing_bars(
+        timestamps,
+        allow_session_gaps=allow_session_gaps,
+        max_session_gap=pd.Timedelta(minutes=max_session_gap_minutes),
+    )
     if missing_bars > missing_threshold:
         raise ValueError(f"Missing bars {missing_bars} exceeds threshold {missing_threshold}")
 
@@ -77,7 +86,11 @@ def validate_ohlcv(frame: pd.DataFrame, missing_threshold: int = 0) -> DataQuali
     )
 
 
-def _count_missing_bars(timestamps: pd.Series) -> int:
+def _count_missing_bars(
+    timestamps: pd.Series,
+    allow_session_gaps: bool = False,
+    max_session_gap: pd.Timedelta = pd.Timedelta(hours=3),
+) -> int:
     if len(timestamps) < 3:
         return 0
     deltas = timestamps.diff().dropna()
@@ -85,4 +98,20 @@ def _count_missing_bars(timestamps: pd.Series) -> int:
     if expected <= pd.Timedelta(0):
         return 0
     missing = ((deltas / expected).round().astype(int) - 1).clip(lower=0)
+    if allow_session_gaps:
+        gap_mask = deltas > expected
+        for index in deltas[gap_mask].index:
+            previous_timestamp = timestamps.iloc[index - 1]
+            current_timestamp = timestamps.iloc[index]
+            if _is_market_session_gap(previous_timestamp, current_timestamp, max_session_gap):
+                missing.loc[index] = 0
     return int(missing.sum())
+
+
+def _is_market_session_gap(previous_timestamp: pd.Timestamp, current_timestamp: pd.Timestamp, max_session_gap: pd.Timedelta) -> bool:
+    if current_timestamp <= previous_timestamp:
+        return False
+    if current_timestamp - previous_timestamp <= max_session_gap:
+        return True
+    dates = pd.date_range(previous_timestamp.normalize(), current_timestamp.normalize(), freq="D")
+    return any(day.weekday() >= 5 for day in dates)

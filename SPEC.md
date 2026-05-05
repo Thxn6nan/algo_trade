@@ -1,272 +1,559 @@
 # SPEC.md — Algorithmic Trading Core Specification
 
-> Scope: Core algorithmic trading system specification for `ml_trade`.
-> This document focuses on the **Algo Trade layer**: market data, feature preparation, signal generation, trade lifecycle, risk management, backtesting, execution, logging, and performance evaluation.
->
-> Out of scope: deep ML architecture internals, model training theory, online learning design, sentiment model internals, and external macro API implementation details.
+> Project: `ml_trade`  
+> Layer: Algorithmic Trading Core  
+> Status: Refined production-oriented specification  
+> Primary target: solo-developer, resume-ready, MT5-compatible quant trading platform  
+> Default language for implementation: Python  
+> Default broker interface: MetaTrader 5  
+
+---
+
+## 0. Review Outcome
+
+This specification refines the original Algo Trade SPEC into a stricter engineering contract.
+
+The major corrections are:
+
+1. Separate **strategy logic** from **platform infrastructure**.
+2. Add explicit **time semantics** to prevent lookahead bias.
+3. Define stable **data contracts** for candles, features, signals, decisions, orders, positions, and trades.
+4. Add **acceptance criteria** so the project can be tested instead of merely described.
+5. Make execution safer through **idempotency**, **broker reconciliation**, and **live-mode gates**.
+6. Convert vague production-readiness goals into concrete **promotion gates**.
+7. Clarify that the platform is not production-grade because it is complex; it is production-oriented only when it is reproducible, observable, and difficult to fool.
+
+### 0.1 Resolved Assumptions
+
+The following assumptions are locked for this SPEC:
+
+| Topic | Decision |
+|---|---|
+| Broker | MetaTrader 5 first; other brokers later through adapter interface |
+| Execution style | Low-frequency / medium-frequency candle-based trading, not HFT |
+| Primary mode | Backtest → walk-forward → shadow → paper → micro-live |
+| Initial storage | SQLite locally; migration to PostgreSQL allowed later |
+| Market data granularity | OHLCV candles; lower timeframe data optional for intrabar resolution |
+| Live safety default | Halt new trades first; do not auto-close all positions unless explicitly configured |
+| Same-bar TP/SL default | Conservative: assume stop loss first |
+| Risk default | Fixed fractional risk; Kelly is research-only unless capped |
+| Model internals | Out of scope; model output contract is in scope |
 
 ---
 
 ## 1. Purpose
 
-The purpose of this module is to define a reliable, testable, and extensible algorithmic trading core that can:
+The purpose of the Algo Trade Core is to provide a reliable, testable, observable, and extensible trading system that can:
 
-1. Read and validate market data.
-2. Generate trading signals from rule-based or model-based inputs.
-3. Convert signals into risk-controlled trade decisions.
-4. Backtest strategies using realistic trade lifecycle simulation.
-5. Execute orders through MetaTrader 5 in live or paper mode.
-6. Log every trade decision for debugging and performance analysis.
-7. Enforce safety mechanisms such as position limits, drawdown limits, spread filters, and kill switches.
+1. Load and validate market data.
+2. Build leak-safe feature sets.
+3. Accept rule-based or model-based strategy signals.
+4. Convert signals into risk-controlled trade decisions.
+5. Simulate trade lifecycle realistically in backtests.
+6. Execute or simulate orders through a broker adapter.
+7. Reconcile local state with broker state.
+8. Log every decision, rejection, order, fill, trade, error, and risk event.
+9. Produce reproducible reports for research, debugging, and resume use.
 
-The system must behave as a **trading system**, not merely a prediction script.
+The system must behave as a **trading platform**, not a prediction script.
 
-A valid trading system must answer:
+A valid run must be able to answer:
 
 ```text
 What data was used?
-Why did the system enter or reject a trade?
-How much was risked?
-Where are SL/TP/timeout exits?
-What happened after execution?
-How did the system perform after realistic costs?
+Which config was used?
+Which model and feature schema were used?
+Why did the system enter, reject, hold, or exit?
+How much risk was allocated?
+Where were SL, TP, and timeout exits?
+What did the broker or simulator actually fill?
+What happened after realistic costs?
+Can the result be reproduced?
 ```
 
 ---
 
-## 2. High-Level Architecture
+## 2. Requirement Levels
+
+This SPEC uses the following requirement levels:
+
+| Term | Meaning |
+|---|---|
+| MUST | Required for correctness or safety |
+| SHOULD | Strongly recommended; can be postponed with justification |
+| MAY | Optional extension |
+| MUST NOT | Forbidden behavior |
+
+A feature is not considered complete unless its MUST requirements are implemented and tested.
+
+---
+
+## 3. Scope
+
+### 3.1 In Scope
 
 ```text
-Market Data
-    ↓
-Data Validation
-    ↓
-Feature / Indicator Pipeline
-    ↓
-Signal Generation
-    ↓
-Signal Filtering
-    ↓
-Risk Management
-    ↓
-Order Construction
-    ↓
-Execution / Backtest Engine
-    ↓
-Trade State Tracking
-    ↓
-Performance Report
-    ↓
-Decision & Trade Logs
+market data loading
+market data validation
+symbol metadata registry
+feature pipeline contract
+strategy signal interface
+signal filtering
+risk management
+position sizing
+order construction
+backtest execution
+walk-forward orchestration
+live/shadow/paper loop
+MT5 broker adapter
+trade lifecycle tracking
+state reconciliation
+kill switches
+logging
+SQLite persistence
+performance reporting
+robustness testing
+configuration management
+promotion gates
 ```
 
-The core system should support both:
+### 3.2 Out of Scope
 
 ```text
-Backtest Mode:
-Historical data → simulated orders → performance report
-
-Live Mode:
-MT5 live data → signals → risk checks → real/paper orders → monitoring
+deep ML architecture internals
+model training theory
+online learning in live trading
+sentiment model internals
+macro data provider implementation
+high-frequency trading
+order book market making
+exchange co-location
+latency arbitrage
+guaranteed profitability
+fully autonomous self-optimization in live mode
 ```
 
 ---
 
-## 3. Operating Modes
+## 4. High-Level Architecture
 
-The Algo Trade layer must support the following modes.
+The core architecture should follow a **ports-and-adapters** style.
 
-| Mode | Description | Order Execution |
-|---|---|---|
-| `research` | Data exploration and feature inspection | Disabled |
-| `backtest` | Historical strategy simulation | Simulated |
-| `walk_forward` | Multiple train/test historical windows | Simulated |
-| `shadow` | Live signals, no order submission | Disabled |
-| `paper` | Live signals with demo/paper execution | Demo / paper |
-| `live` | Real account execution | Real broker |
+```text
+                ┌────────────────────┐
+                │     Config Layer    │
+                └─────────┬──────────┘
+                          │
+┌──────────────┐   ┌───────▼────────┐   ┌──────────────────┐
+│ Market Data  │──▶│ Data Validator │──▶│ Feature Pipeline │
+└──────────────┘   └────────────────┘   └────────┬─────────┘
+                                                   │
+                                           ┌───────▼────────┐
+                                           │ Strategy Layer │
+                                           └───────┬────────┘
+                                                   │ Signal
+                                           ┌───────▼────────┐
+                                           │ Signal Filters │
+                                           └───────┬────────┘
+                                                   │
+                                           ┌───────▼────────┐
+                                           │  Risk Engine   │
+                                           └───────┬────────┘
+                                                   │ Decision
+                                           ┌───────▼────────┐
+                                           │ Order Builder  │
+                                           └───────┬────────┘
+                                                   │
+                        ┌──────────────────────────┴──────────────────────────┐
+                        │                                                     │
+                ┌───────▼────────┐                                    ┌───────▼────────┐
+                │ Backtest Engine │                                    │ Broker Adapter │
+                └───────┬────────┘                                    └───────┬────────┘
+                        │                                                     │
+                ┌───────▼────────┐                                    ┌───────▼────────┐
+                │ Trade Lifecycle│                                    │ Reconciliation │
+                └───────┬────────┘                                    └───────┬────────┘
+                        │                                                     │
+                        └──────────────────────┬──────────────────────────────┘
+                                               │
+                                      ┌────────▼─────────┐
+                                      │ Logs + Storage   │
+                                      └────────┬─────────┘
+                                               │
+                                      ┌────────▼─────────┐
+                                      │ Reports/Dashboard│
+                                      └──────────────────┘
+```
 
-### 3.1 Mode Safety Rules
+### 4.1 Architectural Rule
 
-- `research`, `backtest`, and `walk_forward` must never send live orders.
-- `shadow` must generate and log trade decisions but must not send orders.
-- `paper` must use demo account or paper execution only.
-- `live` must require explicit confirmation and strict risk caps.
+The strategy layer MUST NOT directly send broker orders.
 
-Example CLI behavior:
+Allowed flow:
+
+```text
+Strategy → Signal → Filters → Risk Engine → Order Builder → Execution Adapter
+```
+
+Forbidden flow:
+
+```text
+Strategy → Broker API
+```
+
+---
+
+## 5. Operating Modes
+
+| Mode | Description | Order Submission | Storage | Intended Use |
+|---|---|---:|---:|---|
+| `research` | Explore data/features | No | Optional | notebooks, diagnostics |
+| `backtest` | Single historical simulation | Simulated | Required | strategy test |
+| `walk_forward` | Rolling train/validation/test simulation | Simulated | Required | OOS validation |
+| `shadow` | Live data + live signals, no orders | No | Required | live behavior observation |
+| `paper` | Live signals with demo/paper orders | Demo/paper only | Required | execution rehearsal |
+| `micro_live` | Small real-money test | Real | Required | final staged validation |
+| `live` | Full allowed live mode | Real | Required | production use |
+
+### 5.1 Mode Safety Rules
+
+```text
+research/backtest/walk_forward MUST NOT call broker order_send.
+shadow MUST NOT submit orders.
+paper MUST require a demo account or explicit paper broker adapter.
+micro_live and live MUST require explicit confirmation.
+live MUST NOT be the default mode.
+```
+
+Example CLI:
 
 ```bash
-python run.py --mode backtest
-python run.py --mode shadow
-python run.py --mode paper
+python run.py --mode backtest --config configs/backtest.yaml
+python run.py --mode shadow --config configs/shadow.yaml
+python run.py --mode paper --config configs/paper.yaml
+python run.py --mode micro_live --live-confirm I_UNDERSTAND_RISK
 python run.py --mode live --live-confirm I_UNDERSTAND_RISK
 ```
 
+### 5.2 Live Confirmation Requirements
+
+Live-capable modes MUST check:
+
+```text
+account_id == expected_account_id
+server == expected_server
+mode in [micro_live, live]
+live_confirm == required phrase
+risk profile is not research/paper
+kill switch is not active
+configuration hash is stored
+```
+
+If any check fails, the system MUST halt before order construction.
+
 ---
 
-## 4. Data Requirements
+## 6. Time and Candle Semantics
 
-### 4.1 Required Market Data
+Time semantics are mandatory because most trading bugs are hidden lookahead bugs wearing a fake mustache.
 
-The minimum market data format is OHLCV:
+### 6.1 Timestamp Convention
 
-| Field | Description |
-|---|---|
-| `timestamp` | Candle timestamp |
-| `open` | Opening price |
-| `high` | Highest price in candle |
-| `low` | Lowest price in candle |
-| `close` | Closing price |
-| `volume` | Tick volume or real volume |
-| `spread` | Broker spread if available |
-
-### 4.2 Supported Timeframes
-
-The system should support multi-timeframe data, for example:
+Every candle MUST define whether `timestamp` means:
 
 ```text
-M5
-M15
-M30
-H1
-H4
-D1
+candle_open_time
+or
+candle_close_time
 ```
 
-The primary trading timeframe should be configurable.
-
-Example:
-
-```python
-PRIMARY_TIMEFRAME = "M15"
-CONFIRMATION_TIMEFRAMES = ["M15", "H4"]
-```
-
-### 4.3 Supported Symbols
-
-The symbol universe must be registry-driven.
-
-Each symbol must define:
+Default convention:
 
 ```text
-symbol name
-asset class
-pip size
-pip value
-contract size
-min lot
-max lot
-lot step
-average spread
-trading session
-broker suffix if any
-magic number
+timestamp = candle_open_time in broker timezone
 ```
+
+Each loaded dataset MUST store:
+
+```text
+source_timezone
+broker_timezone
+utc_offset_policy
+session calendar
+DST handling policy
+```
+
+### 6.2 Signal Timing Rule
+
+For candle-based strategies:
+
+```text
+Features for candle t may use data up to candle t close.
+A signal produced after candle t close may execute no earlier than candle t+1 open.
+```
+
+Valid:
+
+```text
+features[t] → signal[t] → execution_price[t+1 open]
+```
+
+Invalid:
+
+```text
+features[t+1] → signal[t]
+close[t+1] → signal[t]
+high[t+1]/low[t+1] → signal[t]
+```
+
+### 6.3 Live Candle Completion Rule
+
+In live mode, the system MUST NOT generate candle-close signals from an unfinished candle unless the strategy explicitly declares it supports intrabar signals.
+
+Default:
+
+```text
+use_closed_candles_only = true
+```
+
+---
+
+## 7. Data Requirements
+
+### 7.1 Candle Schema
+
+Minimum candle schema:
+
+| Field | Type | Required | Description |
+|---|---|---:|---|
+| `timestamp` | datetime | Yes | candle open time unless otherwise documented |
+| `open` | float | Yes | opening price |
+| `high` | float | Yes | highest price |
+| `low` | float | Yes | lowest price |
+| `close` | float | Yes | closing price |
+| `volume` | float | Yes | tick or real volume |
+| `spread` | float | Strongly recommended | spread in points or price units, declared in metadata |
+| `symbol` | string | Recommended | required for multi-symbol datasets |
+| `timeframe` | string | Recommended | required for multi-timeframe datasets |
+
+### 7.2 Supported Timeframes
+
+The system SHOULD support:
+
+```text
+M1, M5, M15, M30, H1, H4, D1
+```
+
+The primary trading timeframe MUST be configurable.
 
 Example:
 
 ```yaml
+timeframes:
+  primary: M15
+  confirmations: [H1, H4]
+```
+
+### 7.3 Multi-Timeframe Alignment
+
+When using higher timeframe features:
+
+```text
+H4 feature values MUST only become available after the H4 candle closes.
+Lower timeframe rows MUST NOT see future higher timeframe closes.
+```
+
+Implementation requirement:
+
+```text
+Use as-of joins with closed-candle timestamps only.
+```
+
+---
+
+## 8. Symbol Registry
+
+The symbol universe MUST be registry-driven.
+
+Each symbol MUST define enough metadata for sizing, validation, execution, and reporting.
+
+### 8.1 Required Symbol Metadata
+
+```yaml
 XAUUSDm:
+  canonical_symbol: XAUUSD
+  broker_symbol: XAUUSDm
   asset_class: metal
-  magic: 7001
+  base_currency: XAU
+  quote_currency: USD
+  profit_currency: USD
+  margin_currency: USD
   pip_size: 0.01
+  tick_size: 0.01
+  tick_value: 1.0
+  contract_size: 100
   min_lot: 0.01
+  max_lot: 50.0
   lot_step: 0.01
+  stop_level_points: 0
+  freeze_level_points: 0
+  average_spread_points: 18
+  max_spread_points: 60
+  trading_sessions:
+    timezone: broker
+    sessions:
+      - day: monday
+        open: "01:00"
+        close: "23:59"
+  filling_modes: [IOC, FOK]
+  allowed_order_types: [MARKET, LIMIT, STOP]
+  magic: 7001
+  enabled: true
+```
+
+### 8.2 Symbol Registry Rules
+
+```text
+Missing symbol metadata MUST be a hard failure.
+Position sizing MUST use symbol metadata.
+Execution validation MUST use broker metadata when available.
+Backtest assumptions MUST be derived from the same registry where possible.
 ```
 
 ---
 
-## 5. Data Validation Specification
+## 9. Data Validation
 
-Before any backtest, live signal generation, or training run, OHLCV data must pass validation.
+Before any training, backtest, walk-forward run, shadow run, paper run, or live run, market data MUST pass validation.
 
-### 5.1 Required Checks
+### 9.1 Required Checks
 
-The system must reject or flag data if:
+The validator MUST check:
 
 ```text
-- timestamps are duplicated
-- timestamps are not sorted
-- required OHLCV columns are missing
-- high < open, close, or low
-- low > open, close, or high
-- close <= 0
-- open <= 0
-- high <= 0
-- low <= 0
-- volume < 0
-- spread < 0
-- missing bars exceed configured threshold
-- timezone is unknown or inconsistent
+required columns exist
+timestamps are parseable
+timestamps are sorted ascending
+timestamps are unique per symbol/timeframe
+OHLC values are positive
+high >= max(open, close, low)
+low <= min(open, close, high)
+volume >= 0
+spread >= 0 when spread exists
+missing bars <= configured threshold
+timezone metadata exists
+symbol exists in registry
+no unexpected duplicate bars
+no infinite values
+NaN policy is applied and logged
 ```
 
-### 5.2 Data Quality Report
+### 9.2 Missing Bar Policy
 
-Each data load should generate a summary:
+The system MUST support configurable missing-bar behavior:
+
+| Policy | Behavior |
+|---|---|
+| `fail` | Stop if missing bars exceed threshold |
+| `warn` | Continue but log warning |
+| `fill_flat` | Fill OHLC with previous close and volume 0 |
+| `drop` | Drop affected rows after feature generation |
+
+Default for backtest:
 
 ```text
-Symbol: XAUUSDm
-Timeframe: M15
-Rows: 250000
-Start: 2021-01-01
-End: 2026-05-01
-Duplicate timestamps: 0
-Missing bars: 132
-Invalid candles: 0
-Median spread: 18 points
-P95 spread: 42 points
-Timezone: Broker time / UTC offset documented
+missing_bar_policy = warn
 ```
 
-### 5.3 Hard Failure Conditions
-
-The system must stop immediately if:
+Default for live:
 
 ```text
-- OHLC values are structurally invalid
-- feature schema does not match model schema
-- model checkpoint and scaler are mismatched
-- live data is stale
-- symbol metadata is missing
+missing_bar_policy = fail_if_recent_data_missing
+```
+
+### 9.3 Data Quality Report
+
+Every data load MUST produce a report:
+
+```text
+run_id
+symbol
+timeframe
+rows
+start_time
+end_time
+duplicate_timestamps
+missing_bars
+invalid_candles
+NaN_count
+infinite_count
+median_spread
+p95_spread
+timezone
+source
+validation_status
+```
+
+### 9.4 Hard Failure Conditions
+
+The system MUST stop immediately if:
+
+```text
+OHLC structure is invalid
+required columns are missing
+symbol metadata is missing
+feature schema does not match model schema
+model checkpoint and scaler hashes are mismatched
+live data is stale
+latest candle is older than allowed threshold
+account ID does not match expected live account
+broker position state cannot be reconciled safely
 ```
 
 ---
 
-## 6. Feature / Indicator Layer
+## 10. Feature and Indicator Layer
 
-The Algo Trade layer should not depend on a specific model. It should accept any valid feature source.
+The Algo Trade Core MUST NOT depend on a specific ML model.
 
-Feature sources may include:
+It SHOULD accept features from:
 
 ```text
-- raw OHLCV values
-- technical indicators
-- volatility measures
-- return features
-- trend features
-- regime features
-- model probabilities
-- macro/sentiment features from upstream modules
+raw OHLCV
+technical indicators
+volatility features
+return features
+trend features
+regime features
+model probabilities
+macro/sentiment upstream modules
+custom strategy features
 ```
 
-### 6.1 Minimum Technical Features
+### 10.1 Minimum Technical Features
 
-The system should support these common indicators:
+The system SHOULD provide reusable implementations for:
 
 | Feature | Purpose |
 |---|---|
-| Return | Measures price change |
-| Log Return | Stable additive return representation |
-| ATR | Volatility and stop sizing |
-| RSI | Momentum / mean reversion |
-| EMA fast / slow | Trend direction |
-| MACD | Momentum confirmation |
-| ADX | Trend strength |
-| Bollinger Bands | Volatility band / mean reversion |
-| Rolling High / Low | Breakout logic |
+| simple return | directional movement |
+| log return | additive return representation |
+| ATR | volatility and stop sizing |
+| RSI | momentum / mean reversion |
+| EMA fast/slow | trend direction |
+| MACD | momentum confirmation |
+| ADX | trend strength |
+| Bollinger Bands | volatility bands |
+| rolling high/low | breakout logic |
+| realized volatility | volatility regime |
+| session features | time/session behavior |
+| spread features | cost-aware filtering |
 
-### 6.2 Feature Schema Lock
+### 10.2 Feature Schema Lock
 
-For any model-based signal, the feature order must be locked.
+For model-based signals, feature schema MUST be locked.
+
+Example:
 
 ```python
 FEATURE_SCHEMA = [
@@ -275,55 +562,137 @@ FEATURE_SCHEMA = [
     "ema_fast_m15",
     "ema_slow_m15",
     "adx_m15",
-    "spread",
+    "spread_points",
     "regime_trending_prob",
 ]
 ```
 
-At inference time:
-
-```python
-assert list(features.columns) == FEATURE_SCHEMA
-```
-
-The system must reject inference if:
+Inference MUST reject features if:
 
 ```text
-- feature count differs
-- feature names differ
-- feature order differs
-- NaN or infinite values exist
+feature count differs
+feature names differ
+feature order differs
+feature dtype is invalid
+NaN exists after allowed warmup period
+infinite values exist
+scaler hash does not match model metadata
+schema version does not match model metadata
+```
+
+### 10.3 Leakage Guard
+
+Feature functions MUST declare:
+
+```text
+lookback_window
+required_columns
+uses_future_data = false
+output_columns
+warmup_bars
+```
+
+Feature generation MUST drop or mark warmup rows before signal generation.
+
+### 10.4 Multi-Symbol Feature Rule
+
+For multi-symbol datasets:
+
+```text
+rolling indicators MUST be computed per symbol, not across the full DataFrame.
+```
+
+Forbidden:
+
+```python
+df["atr"] = atr(df)  # accidentally mixes symbols
+```
+
+Required:
+
+```python
+df.groupby("symbol").apply(compute_features)
 ```
 
 ---
 
-## 7. Signal Specification
+## 11. Strategy Interface
 
-A signal is an intermediate trading intent, not an executable order.
+A strategy is a signal generator. It MUST NOT own risk management, execution, or broker state.
 
-### 7.1 Signal Format
+### 11.1 Strategy Contract
 
-Each signal should contain:
+Each strategy MUST implement:
+
+```python
+class Strategy:
+    name: str
+    version: str
+    required_features: list[str]
+
+    def generate_signal(self, context: StrategyContext) -> Signal:
+        ...
+```
+
+### 11.2 Strategy Context
 
 ```json
 {
-  "timestamp": "2026-05-04T10:15:00",
+  "timestamp": "2026-05-04T10:15:00+07:00",
   "symbol": "XAUUSDm",
+  "timeframe": "M15",
+  "features": {},
+  "recent_candles": [],
+  "current_positions": [],
+  "mode": "backtest",
+  "config_hash": "..."
+}
+```
+
+### 11.3 Strategy Rules
+
+```text
+Strategy MAY output BUY, SELL, HOLD, CLOSE_LONG, or CLOSE_SHORT.
+Strategy MUST include reason codes or metadata.
+Strategy MUST be deterministic for the same input unless randomness is explicitly seeded and logged.
+Strategy MUST NOT call broker APIs.
+Strategy MUST NOT read future candles.
+```
+
+---
+
+## 12. Signal Specification
+
+A signal is an intermediate trading intent, not an executable order.
+
+### 12.1 Signal Object
+
+```json
+{
+  "signal_id": "sig_20260504_XAUUSDm_M15_000001",
+  "run_id": "run_20260504_001",
+  "timestamp": "2026-05-04T10:15:00+07:00",
+  "symbol": "XAUUSDm",
+  "timeframe": "M15",
   "side": "BUY",
   "confidence": 0.68,
   "expected_return": 0.0021,
   "source": "ml_model",
-  "timeframe": "M15",
+  "strategy_name": "triple_barrier_lstm",
+  "strategy_version": "0.5.0",
+  "model_version": "model_20260504_a",
+  "feature_schema_version": "features_v3",
   "metadata": {
     "buy_prob": 0.68,
     "sell_prob": 0.21,
+    "hold_prob": 0.11,
     "uncertainty": 0.07,
     "regime": "TRENDING"
   }
 }
 ```
 
-### 7.2 Valid Signal Sides
+### 12.2 Valid Signal Sides
 
 ```text
 BUY
@@ -333,146 +702,125 @@ CLOSE_LONG
 CLOSE_SHORT
 ```
 
-### 7.3 Rule-Based Example Signals
+### 12.3 Signal Validation
 
-#### Moving Average Crossover
-
-```text
-If EMA fast > EMA slow → BUY
-If EMA fast < EMA slow → SELL
-Otherwise → HOLD
-```
-
-#### RSI Mean Reversion
+The system MUST reject malformed signals if:
 
 ```text
-If RSI < 30 → BUY
-If RSI > 70 → SELL
-Otherwise → HOLD
-```
-
-#### Breakout
-
-```text
-If close > rolling_high_20 → BUY
-If close < rolling_low_20 → SELL
-Otherwise → HOLD
-```
-
-### 7.4 Model-Based Signal
-
-For model output probabilities:
-
-```text
-If buy_prob > buy_threshold and buy_prob > sell_prob → BUY
-If sell_prob > sell_threshold and sell_prob > buy_prob → SELL
-Otherwise → HOLD
-```
-
-Example:
-
-```python
-if buy_prob > min_buy_threshold and buy_prob > sell_prob:
-    side = "BUY"
-elif sell_prob > min_sell_threshold and sell_prob > buy_prob:
-    side = "SELL"
-else:
-    side = "HOLD"
+side is invalid
+symbol is unknown
+confidence is outside [0, 1]
+timestamp is missing
+strategy name/version is missing
+feature schema version is missing for model-based signals
+source is unknown
 ```
 
 ---
 
-## 8. Signal Filtering
+## 13. Signal Filtering
 
-A raw signal must pass filters before becoming a trade decision.
+A raw signal MUST pass filters before becoming an approved trade decision.
 
-### 8.1 Required Filters
+### 13.1 Required Filters
 
 ```text
-- confidence threshold
-- spread filter
-- risk/reward filter
-- volatility filter
-- session filter
-- max position filter
-- correlation filter
-- daily risk budget filter
-- kill switch filter
-- regime blacklist filter
-- news/event filter if enabled
+confidence threshold
+spread filter
+risk/reward filter
+volatility filter
+session filter
+max position filter
+symbol exposure filter
+correlation exposure filter
+daily risk budget filter
+weekly risk budget filter
+kill switch filter
+regime blacklist filter
+news/event filter if enabled
+stale data filter
+conflicting position filter
 ```
 
-### 8.2 Spread Filter
+### 13.2 Filter Output Contract
+
+Each filter MUST return:
+
+```json
+{
+  "filter_name": "spread_filter",
+  "passed": false,
+  "reason_code": "spread_too_high",
+  "observed_value": 58,
+  "threshold": 45,
+  "severity": "reject"
+}
+```
+
+### 13.3 Spread Filter
 
 Reject trade if:
 
 ```text
-current_spread > max_allowed_spread
+current_spread_points > max_allowed_spread_points
 ```
 
-Recommended dynamic version:
+Dynamic version:
 
 ```text
-current_spread > median_spread * spread_multiplier
+current_spread_points > median_spread_points * spread_multiplier
 ```
 
 Example:
 
 ```python
-if current_spread > median_spread * 2.5:
+if current_spread_points > median_spread_points * 2.5:
     reject("spread_too_high")
 ```
 
-### 8.3 Risk/Reward Filter
+### 13.4 Risk/Reward Filter
 
-Reject trade if expected R:R is below minimum.
+Reject trade if:
 
 ```text
-reward / risk < MIN_RR
+reward / risk < min_rr
 ```
 
 Default:
 
-```python
-MIN_RR = 1.5
+```yaml
+signal:
+  min_rr: 1.5
 ```
 
-### 8.4 Regime Filter
+### 13.5 Regime Filter
 
-The system may reject trades during dangerous regimes.
-
-Example:
+Example behavior:
 
 ```text
-If regime == BLACK_SWAN → reject all new trades
-If regime == HIGH_VOLATILITY → reduce size or require higher confidence
+BLACK_SWAN → reject all new trades
+HIGH_VOLATILITY → reduce size or require higher confidence
+LOW_LIQUIDITY → reject market orders or require wider cost model
 ```
 
-### 8.5 MTF Confirmation Filter
+### 13.6 Multi-Timeframe Confirmation Filter
 
-For trend-following signals:
+For trend-following strategies:
 
 ```text
-H4 trend must align with trade direction
-M15 momentum must not strongly oppose trade direction
+BUY allowed only if higher timeframe trend is bullish and lower timeframe momentum is not strongly bearish.
+SELL allowed only if higher timeframe trend is bearish and lower timeframe momentum is not strongly bullish.
 ```
 
-Example:
-
-```text
-BUY allowed only if:
-- H4 EMA fast > H4 EMA slow
-- H4 ADX above trend threshold
-- M15 momentum not bearish
-```
+The exact rule MUST be configurable per strategy.
 
 ---
 
-## 9. Trade Decision Specification
+## 14. Trade Decision Specification
 
-A trade decision is the result of passing a signal through filters and risk management.
+A trade decision is the result of signal validation, filtering, and risk evaluation.
 
-### 9.1 Decision Types
+### 14.1 Decision Types
 
 ```text
 ENTER_LONG
@@ -484,11 +832,14 @@ HOLD
 HALT
 ```
 
-### 9.2 Decision Object
+### 14.2 Approved Decision Object
 
 ```json
 {
-  "timestamp": "2026-05-04T10:15:00",
+  "decision_id": "dec_20260504_XAUUSDm_000001",
+  "signal_id": "sig_20260504_XAUUSDm_M15_000001",
+  "run_id": "run_20260504_001",
+  "timestamp": "2026-05-04T10:15:00+07:00",
   "symbol": "XAUUSDm",
   "decision": "ENTER_LONG",
   "side": "BUY",
@@ -496,8 +847,9 @@ HALT
   "entry_price_estimate": 2310.50,
   "stop_loss": 2304.00,
   "take_profit": 2323.50,
-  "risk_pct": 0.25,
-  "position_size": 0.03,
+  "risk_pct": 0.0025,
+  "risk_amount": 25.00,
+  "position_size_lots": 0.03,
   "rr": 2.0,
   "status": "APPROVED",
   "reasons": [
@@ -506,15 +858,19 @@ HALT
     "spread_ok",
     "rr_ok",
     "risk_budget_ok"
-  ]
+  ],
+  "config_hash": "..."
 }
 ```
 
-### 9.3 Rejected Decision Object
+### 14.3 Rejected Decision Object
 
 ```json
 {
-  "timestamp": "2026-05-04T10:15:00",
+  "decision_id": "dec_20260504_XAUUSDm_000002",
+  "signal_id": "sig_20260504_XAUUSDm_M15_000002",
+  "run_id": "run_20260504_001",
+  "timestamp": "2026-05-04T10:30:00+07:00",
   "symbol": "XAUUSDm",
   "decision": "REJECT",
   "side": "BUY",
@@ -522,284 +878,505 @@ HALT
   "reasons": [
     "spread_too_high",
     "rr_below_minimum"
-  ]
+  ],
+  "filter_results": []
 }
 ```
 
-Every raw signal must produce either an approved trade decision or a rejected decision log.
+### 14.4 Decision Logging Rule
+
+Every valid raw signal MUST produce exactly one of:
+
+```text
+APPROVED decision
+REJECTED decision
+HOLD decision
+HALT decision
+```
+
+Silent signal disappearance is forbidden.
 
 ---
 
-## 10. Risk Management Specification
+## 15. Risk Management
 
 Risk management is mandatory. No signal may bypass the risk layer.
 
-### 10.1 Risk Constraints
+### 15.1 Risk Constraints
 
-The system must enforce:
+The risk engine MUST enforce:
 
 ```text
-- maximum risk per trade
-- maximum daily loss
-- maximum weekly loss
-- maximum open positions
-- maximum symbol exposure
-- maximum correlated exposure
-- maximum lot size
-- minimum lot size
-- broker lot step
-- stop loss required for every position
+maximum risk per trade
+maximum daily realized loss
+maximum daily total loss including open PnL if configured
+maximum weekly loss
+maximum account drawdown
+maximum open positions
+maximum symbol exposure
+maximum correlated exposure
+maximum lot size
+minimum lot size
+broker lot step
+required stop loss
+minimum stop distance
+maximum stop distance if configured
+margin sufficiency
+session-level risk cap if configured
 ```
 
-### 10.2 Recommended Risk Modes
+### 15.2 Risk Profiles
 
-| Mode | Risk Per Trade | Daily Loss Limit | Description |
-|---|---:|---:|---|
-| `research` | 0% | 0% | No execution |
-| `paper` | 0% | 0% | Demo only |
-| `micro_live` | 0.10–0.25% | 0.5–1.0% | First real-money testing |
-| `conservative` | 0.25–0.50% | 1.0–1.5% | Stable live mode |
-| `aggressive` | up to 1.0% | 2.0–3.0% | Only after proven edge |
+| Profile | Risk Per Trade | Daily Loss Limit | Weekly Loss Limit | Use |
+|---|---:|---:|---:|---|
+| `research` | 0% | 0% | 0% | no execution |
+| `backtest` | configurable | configurable | configurable | simulation only |
+| `paper` | virtual only | virtual only | virtual only | demo/paper |
+| `micro_live` | 0.10–0.25% | 0.5–1.0% | 1.0–2.0% | first real-money test |
+| `conservative` | 0.25–0.50% | 1.0–1.5% | 2.0–3.0% | stable mode |
+| `aggressive` | up to 1.0% | 2.0–3.0% | 4.0–6.0% | only after proven edge |
 
-### 10.3 Position Sizing
+Important distinction:
+
+```text
+paper risk is virtual risk, not real capital risk.
+```
+
+### 15.3 Position Sizing
 
 Base formula:
 
 ```text
-risk_amount = account_equity * risk_per_trade
-position_size = risk_amount / stop_distance_value
+risk_amount = account_equity × risk_per_trade
+position_size_lots = risk_amount / loss_per_lot_if_stop_hit
 ```
 
-For CFD/FX, position sizing must account for:
+The sizing function MUST account for:
 
 ```text
-pip value
+entry price
+stop loss price
 contract size
-lot size
-symbol currency
+tick size
+tick value
+pip size
+lot step
+min lot
+max lot
+symbol profit currency
 account currency
+FX conversion if profit currency differs from account currency
 ```
 
-### 10.4 Fractional Kelly Rule
+### 15.4 Lot Rounding Rule
 
-If Kelly sizing is used, it must be capped.
+After calculating raw size:
+
+```text
+rounded_lot = floor(raw_lot / lot_step) × lot_step
+```
+
+If `rounded_lot < min_lot`, behavior MUST be configurable:
+
+| Policy | Behavior |
+|---|---|
+| `reject` | reject trade |
+| `min_lot` | use minimum lot only if risk remains below cap |
+
+Default:
+
+```text
+reject
+```
+
+### 15.5 Kelly Sizing
+
+Kelly sizing MAY be used in research.
+
+Live-capable modes MUST NOT use uncapped full Kelly.
+
+Allowed live formula:
 
 ```text
 final_risk = min(fractional_kelly_risk, fixed_risk_cap, volatility_target_risk)
 ```
 
-Recommended:
+Recommended cap:
 
-```python
-FRACTIONAL_KELLY = 0.25
-MAX_RISK_PER_TRADE = 0.005
+```yaml
+risk:
+  fractional_kelly: 0.25
+  max_risk_per_trade: 0.005
 ```
 
-The system must never use uncapped full Kelly sizing in live mode.
+### 15.6 Stop Loss Requirement
 
-### 10.5 Stop Loss Requirement
+Every new position MUST have a stop loss.
 
-Every new position must have a stop loss.
-
-If the broker accepts the order but SL is missing:
+If broker order is filled but SL is missing:
 
 ```text
-1. attempt to set SL immediately
-2. if SL update fails, close position or halt system
-3. log emergency event
+1. attempt immediate SL modification
+2. if modification fails, close position if configured safe
+3. otherwise halt new trades and require manual review
+4. log emergency risk event
 ```
 
 ---
 
-## 11. Trade Lifecycle Specification
+## 16. Order Specification
 
-The system must track trades as stateful objects.
+### 16.1 Supported Order Types
 
-### 11.1 Trade States
+```text
+MARKET
+LIMIT
+STOP
+STOP_LOSS
+TAKE_PROFIT
+CLOSE
+MODIFY
+```
+
+### 16.2 Order Request Object
+
+```json
+{
+  "order_id": "ord_20260504_XAUUSDm_000001",
+  "decision_id": "dec_20260504_XAUUSDm_000001",
+  "client_order_id": "ml_trade_run001_000001",
+  "timestamp": "2026-05-04T10:15:01+07:00",
+  "symbol": "XAUUSDm",
+  "side": "BUY",
+  "order_type": "MARKET",
+  "volume_lots": 0.03,
+  "price": null,
+  "stop_loss": 2304.00,
+  "take_profit": 2323.50,
+  "deviation_points": 20,
+  "magic": 7001,
+  "comment": "ml_trade_v5",
+  "time_in_force": "GTC"
+}
+```
+
+### 16.3 Idempotency Requirement
+
+Before submitting an order, the execution layer MUST check whether the same `client_order_id` has already been sent or filled.
+
+The system MUST NOT accidentally duplicate orders after retry, crash, or reconnect.
+
+---
+
+## 17. Execution Specification
+
+### 17.1 Broker Adapter Interface
+
+The execution layer SHOULD be hidden behind an adapter:
+
+```python
+class BrokerAdapter:
+    def connect(self) -> None: ...
+    def get_account_info(self) -> AccountInfo: ...
+    def get_symbol_info(self, symbol: str) -> SymbolInfo: ...
+    def get_latest_rates(self, symbol: str, timeframe: str, count: int): ...
+    def send_order(self, order: OrderRequest) -> OrderResult: ...
+    def modify_position(self, request: ModifyRequest) -> OrderResult: ...
+    def close_position(self, position_id: str) -> OrderResult: ...
+    def get_open_positions(self) -> list[BrokerPosition]: ...
+```
+
+### 17.2 Pre-Trade Execution Checks
+
+Before sending an order, the system MUST check:
+
+```text
+broker connected
+account ID matches expected account
+server matches expected server
+symbol is visible
+symbol is tradable
+market is open
+spread is acceptable
+lot size is within min/max/step
+SL/TP satisfy broker stop level
+SL/TP satisfy freeze level if modifying
+margin is sufficient
+risk limits are not breached
+position state is reconciled
+client_order_id is not already used
+```
+
+### 17.3 Post-Trade Checks
+
+After sending an order, the system MUST verify:
+
+```text
+broker return code
+actual fill price
+actual fill volume
+partial fill status if supported
+position exists if order filled
+SL/TP are attached
+actual slippage
+commission if available
+local state update succeeded
+risk budget update succeeded
+```
+
+### 17.4 Execution Failure Policy
+
+Execution failures MUST be classified:
+
+| Class | Example | Default Behavior |
+|---|---|---|
+| transient | temporary disconnect | retry with cap |
+| validation | invalid volume | reject and log |
+| risk | margin insufficient | reject and log risk event |
+| critical | filled without SL | emergency handling + halt |
+| unknown | unexpected exception | halt new trades |
+
+---
+
+## 18. Trade Lifecycle
+
+The system MUST track trades as stateful objects.
+
+### 18.1 Trade States
 
 ```text
 SIGNAL_CREATED
 SIGNAL_REJECTED
+DECISION_APPROVED
+DECISION_REJECTED
 ORDER_CREATED
 ORDER_SENT
 ORDER_FILLED
+ORDER_PARTIALLY_FILLED
 ORDER_REJECTED
 POSITION_OPEN
+POSITION_MODIFIED
 POSITION_PARTIALLY_CLOSED
 POSITION_CLOSED_TP
 POSITION_CLOSED_SL
 POSITION_CLOSED_TIMEOUT
 POSITION_CLOSED_SIGNAL
+POSITION_CLOSED_RISK
 POSITION_CLOSED_MANUAL
+POSITION_CLOSED_UNKNOWN
 ERROR
 ```
 
-### 11.2 Entry Logic
+### 18.2 Entry Rules
 
-A trade may be opened only if:
-
-```text
-- signal is approved
-- risk checks pass
-- no conflicting position exists
-- execution mode allows orders
-- market is open
-- symbol is tradable
-- spread is acceptable
-```
-
-### 11.3 Exit Logic
-
-A trade may be closed by:
+A trade may open only if:
 
 ```text
-- stop loss hit
-- take profit hit
-- time stop reached
-- opposite signal
-- risk engine forced exit
-- kill switch
-- manual close
-- system error protection
+signal is valid
+filters pass
+risk checks pass
+no conflicting position exists unless hedging is enabled
+execution mode allows orders
+market is open
+symbol is tradable
+spread is acceptable
+order request is valid
+state is reconciled
 ```
 
-### 11.4 Time Stop
+### 18.3 Exit Rules
 
-The system should support a maximum holding period.
+A trade may close by:
+
+```text
+stop loss hit
+take profit hit
+time stop reached
+opposite signal
+strategy close signal
+risk engine forced exit
+kill switch action
+manual close
+broker-side close
+system error protection
+```
+
+### 18.4 Time Stop
+
+The system MUST support maximum holding period by bars or wall-clock time.
 
 Example:
 
-```python
-TIME_STOP_BARS = 24
+```yaml
+exit:
+  time_stop_bars: 24
+  time_stop_action: close
 ```
 
-If a position remains open for longer than the configured bar limit, it should be closed or marked for closure.
+Allowed actions:
+
+```text
+close
+mark_for_close
+notify_only
+```
+
+Default for backtest:
+
+```text
+close
+```
+
+Default for live:
+
+```text
+mark_for_close unless auto_close_enabled = true
+```
 
 ---
 
-## 12. Backtesting Specification
+## 19. Backtesting Specification
 
-Backtesting must simulate the trade lifecycle, not just signal returns.
+Backtesting MUST simulate trade lifecycle, not just vectorized signal returns.
 
-### 12.1 Required Behavior
+### 19.1 Required Behavior
 
-The backtester must:
-
-```text
-- process candles in chronological order
-- avoid lookahead bias
-- generate signals using only available past/current data
-- open positions based on approved decisions
-- track open positions across multiple bars
-- check TP/SL using high/low prices
-- apply time stop
-- apply transaction costs
-- apply slippage
-- update equity curve
-- log every trade
-```
-
-### 12.2 No Lookahead Rule
-
-Signals generated from candle `t` can only be executed at a valid future price, usually:
+The backtester MUST:
 
 ```text
-next candle open
-or simulated market price after signal time
+process candles in chronological order
+process each symbol independently but share portfolio-level risk state
+avoid lookahead bias
+generate signals using available data only
+execute candle-close signals no earlier than next candle open
+open positions based on approved decisions
+track positions across multiple bars
+check TP/SL using high/low prices
+apply same-bar ambiguity policy
+apply time stop
+apply spread
+apply commission
+apply slippage
+apply swap/overnight cost if configured
+update cash/equity/open PnL
+log every signal, decision, order, fill, rejection, trade, and risk event
 ```
 
-Invalid:
+### 19.2 No-Lookahead Rule
 
-```python
-signal[t] uses close[t+1]
+Valid sequence:
+
+```text
+At close of candle t:
+  compute features using data <= t
+  generate signal[t]
+  approve/reject decision[t]
+
+At candle t+1:
+  execute approved entry at open[t+1] or configured simulated price
 ```
 
-Valid:
+Forbidden:
 
-```python
-signal[t] uses data up to t
-position_return[t+1] uses signal[t]
+```text
+using close[t+1] to decide signal[t]
+using high[t+1]/low[t+1] to decide entry at t
+fitting scaler on full dataset before train/test split
+selecting thresholds on test data
 ```
 
-### 12.3 TP/SL Resolution
+### 19.3 TP/SL Resolution
 
 For long positions:
 
 ```text
-If low <= stop_loss → SL hit
-If high >= take_profit → TP hit
+SL hit if low <= stop_loss
+TP hit if high >= take_profit
 ```
 
 For short positions:
 
 ```text
-If high >= stop_loss → SL hit
-If low <= take_profit → TP hit
+SL hit if high >= stop_loss
+TP hit if low <= take_profit
 ```
 
-### 12.4 Ambiguous Same-Bar TP/SL
+### 19.4 Same-Bar TP/SL Ambiguity
 
-If both TP and SL are touched in the same candle, the backtester must use a deterministic policy.
+If both TP and SL are touched in the same candle, the backtester MUST use a deterministic policy.
 
 Allowed policies:
 
-```text
-conservative: assume SL first
-optimistic: assume TP first
-intrabar: use lower timeframe data if available
-randomized: probabilistic path simulation
-```
+| Policy | Behavior |
+|---|---|
+| `conservative` | assume SL first |
+| `optimistic` | assume TP first |
+| `intrabar` | use lower timeframe data |
+| `randomized` | probabilistic path simulation with seed |
 
-Default should be:
+Default:
 
 ```text
 conservative
 ```
 
-### 12.5 Transaction Costs
+### 19.5 Cost Model
 
-Backtest must include:
+Backtests MUST include:
 
 ```text
 spread
 commission
 slippage
-swap/overnight cost if applicable
+swap or overnight cost if applicable
+currency conversion cost if applicable
 ```
 
-### 12.6 Slippage Model
-
-Recommended scenarios:
+### 19.6 Slippage Model
 
 | Scenario | Slippage Assumption |
 |---|---|
-| Base | 0.5 × spread |
-| Bad | 1.0 × spread |
-| Stress | 2.0 × spread |
-| News | 3.0–5.0 × spread |
+| `none` | 0, research only |
+| `base` | 0.5 × spread |
+| `bad` | 1.0 × spread |
+| `stress` | 2.0 × spread |
+| `news` | 3.0–5.0 × spread |
 
-### 12.7 Backtest Outputs
-
-Backtest must produce:
+Default production-candidate report MUST include at least:
 
 ```text
+base
+bad
+stress
+```
+
+### 19.7 Backtest Outputs
+
+Each backtest MUST produce:
+
+```text
+run metadata
 trade log
+decision log
+rejected signal summary
 equity curve
 drawdown curve
 monthly returns
 symbol-level performance
 strategy-level performance
 cost analysis
-rejected signal summary
+risk event summary
+configuration hash
+model hash if applicable
 ```
 
 ---
 
-## 13. Walk-Forward Testing Specification
+## 20. Walk-Forward Testing
 
-Walk-forward testing is required before paper or live deployment.
+Walk-forward testing is required before paper, micro-live, or live deployment.
 
-### 13.1 Recommended Split
+### 20.1 Default Split
 
 ```text
 Train: 12 months
@@ -812,260 +1389,254 @@ Example:
 
 ```text
 Round 1:
-Train: 2021-01 → 2021-12
+Train:      2021-01 → 2021-12
 Validation: 2022-01 → 2022-03
-Test: 2022-04 → 2022-06
+Test:       2022-04 → 2022-06
 
 Round 2:
-Train: 2021-04 → 2022-03
+Train:      2021-04 → 2022-03
 Validation: 2022-04 → 2022-06
-Test: 2022-07 → 2022-09
+Test:       2022-07 → 2022-09
 ```
 
-### 13.2 Rules
+### 20.2 Walk-Forward Rules
 
 ```text
-- Test set must not be used for parameter tuning
-- Thresholds must be selected on train/validation only
-- Final test results must be locked and reproducible
-- Each round must log model version, config hash, and data range
+Test set MUST NOT be used for tuning.
+Thresholds MUST be selected on train/validation only.
+Scaler MUST be fit on train only.
+Feature selection MUST be fit on train only.
+Each round MUST log data range, model version, scaler hash, config hash, and feature schema version.
+Final test results MUST be immutable unless rerun with a new run_id.
+```
+
+### 20.3 Aggregated Evaluation
+
+Walk-forward report MUST include:
+
+```text
+per-round metrics
+aggregate metrics
+worst round
+best round
+stability of performance
+parameter drift
+trade count per round
+cost impact per round
+drawdown per round
 ```
 
 ---
 
-## 14. Performance Metrics Specification
+## 21. Performance Metrics
 
-The system must not rely on win rate alone.
+The system MUST NOT rely on win rate alone.
 
-### 14.1 Required Metrics
+### 21.1 Required Metrics
 
 ```text
-Total return
-Annualized return if applicable
-Win rate
-Average win
-Average loss
-Profit factor
-Expectancy
+total return
+annualized return if applicable
+win rate
+average win
+average loss
+profit factor
+expectancy
 Sharpe ratio
 Sortino ratio
-Max drawdown
+max drawdown
 Calmar ratio
-Average R multiple
-Median R multiple
-Longest losing streak
-Number of trades
-Exposure time
-Average holding time
-Cost as % of gross profit
-Return by symbol
-Return by regime
-Return by session
+average R multiple
+median R multiple
+longest losing streak
+number of trades
+exposure time
+average holding time
+cost as percentage of gross profit
+return by symbol
+return by regime
+return by session
+monthly returns
+trade frequency
+average slippage
 ```
 
-### 14.2 Expectancy
+### 21.2 Metric Formulas
 
 ```text
 Expectancy = (Win Rate × Average Win) - (Loss Rate × Average Loss)
-```
-
-### 14.3 Profit Factor
-
-```text
-Profit Factor = Gross Profit / Gross Loss
-```
-
-### 14.4 Drawdown
-
-```text
+Profit Factor = Gross Profit / Absolute Gross Loss
 Drawdown = (Equity - Running Peak Equity) / Running Peak Equity
+R Multiple = Net PnL / Initial Risk Amount
+```
+
+### 21.3 Metric Validity Rules
+
+```text
+Sharpe and Sortino MUST disclose return frequency.
+Annualized metrics MUST disclose annualization factor.
+Profit factor MUST handle zero gross loss explicitly.
+Metrics MUST be computed after costs.
+Open trades MUST be handled consistently at report end.
 ```
 
 ---
 
-## 15. Robustness Testing Specification
+## 22. Robustness Testing
 
-Before paper or live deployment, the strategy must pass robustness checks.
+Before paper, micro-live, or live deployment, a strategy MUST pass robustness checks.
 
-### 15.1 Required Tests
+### 22.1 Required Tests
 
 ```text
-- parameter sensitivity test
-- transaction cost stress test
-- spread stress test
-- slippage stress test
-- Monte Carlo trade shuffle
-- remove best N trades test
-- double worst N losses test
-- multi-symbol consistency test
-- regime-based performance analysis
+parameter sensitivity test
+transaction cost stress test
+spread stress test
+slippage stress test
+Monte Carlo trade shuffle
+remove best N trades test
+double worst N losses test
+multi-symbol consistency test
+regime-based performance analysis
+session-based performance analysis
+walk-forward stability analysis
 ```
 
-### 15.2 Parameter Sensitivity
+### 22.2 Parameter Sensitivity
 
-The system should test whether performance survives nearby parameter values.
+Example grid:
 
-Example:
-
-```text
-confidence_threshold = 0.50, 0.55, 0.60, 0.65, 0.70
-ATR_multiplier = 1.5, 2.0, 2.5, 3.0
-TP_R = 1.5, 2.0, 2.5, 3.0
+```yaml
+confidence_threshold: [0.50, 0.55, 0.60, 0.65, 0.70]
+atr_multiplier: [1.5, 2.0, 2.5, 3.0]
+tp_r: [1.5, 2.0, 2.5, 3.0]
 ```
 
-A production candidate should not depend on a single fragile parameter value.
+Production candidate should not depend on one magical parameter value.
 
-### 15.3 Monte Carlo Trade Shuffle
+### 22.3 Monte Carlo Trade Shuffle
 
-The system must estimate drawdown risk by randomizing trade order.
-
-Output:
+Output MUST include:
 
 ```text
-Median max drawdown
-P95 max drawdown
-P99 max drawdown
-Probability of ruin
-Worst simulated losing streak
+median max drawdown
+p95 max drawdown
+p99 max drawdown
+probability of ruin
+worst simulated losing streak
+ending equity distribution
+```
+
+### 22.4 Minimum Robustness Gate
+
+A strategy SHOULD be rejected as production candidate if:
+
+```text
+edge disappears under base cost model
+profit depends on top 1-3 trades
+stress slippage flips expectancy deeply negative
+performance is positive in only one narrow parameter setting
+walk-forward result is dominated by one lucky period
+trade count is too low to infer anything useful
 ```
 
 ---
 
-## 16. Execution Specification
+## 23. Baseline Strategy Requirements
 
-### 16.1 Order Types
+The platform MUST include baseline strategies for comparison.
 
-The execution layer should support:
-
-```text
-market order
-limit order
-stop order
-stop loss
-take profit
-position close
-position modify
-```
-
-### 16.2 Order Request Object
-
-```json
-{
-  "symbol": "XAUUSDm",
-  "side": "BUY",
-  "order_type": "MARKET",
-  "volume": 0.03,
-  "stop_loss": 2304.00,
-  "take_profit": 2323.50,
-  "magic": 7001,
-  "comment": "ml_trade_v5"
-}
-```
-
-### 16.3 Pre-Trade Execution Checks
-
-Before sending an order:
+Required baselines:
 
 ```text
-- MT5 connected
-- account ID matches expected account
-- symbol is visible and tradable
-- market is open
-- spread acceptable
-- lot size within broker min/max/step
-- SL/TP distance satisfies broker stop level
-- margin is sufficient
-- no risk limit breach
-- position state reconciled
+buy and hold where applicable
+random entry with same exit rules
+moving average crossover
+RSI mean reversion
+ATR breakout
+always-hold / no-trade baseline
 ```
 
-### 16.4 Post-Trade Checks
-
-After sending an order:
-
-```text
-- verify order result
-- verify actual fill price
-- verify actual volume
-- verify position exists if filled
-- verify SL/TP attached
-- log slippage
-- update local state
-- update risk budget
-```
+A model-based strategy is not considered validated unless it beats relevant baselines after realistic costs and risk constraints.
 
 ---
 
-## 17. Live State Reconciliation
+## 24. Live State Reconciliation
 
-The system must not rely only on internal memory.
+The system MUST NOT rely only on internal memory.
 
-Every live loop should:
-
-```text
-1. fetch broker open positions
-2. filter by known magic numbers
-3. compare broker state with internal state
-4. detect missing, duplicated, or mismatched positions
-5. resolve mismatch or halt safely
-```
-
-### 17.1 Mismatch Examples
+Every live loop MUST:
 
 ```text
-Internal state says no position, broker has open position
-Internal state says position open, broker has none
-Position volume differs
-Position SL/TP differs
-Unknown position exists with system magic number
+fetch broker open positions
+filter by known magic numbers
+compare broker state with local state
+detect missing, duplicated, or mismatched positions
+update local state if safe
+halt if unsafe
+log reconciliation result
 ```
 
-### 17.2 Required Behavior
+### 24.1 Mismatch Examples
+
+```text
+local state says no position, broker has open position
+local state says position open, broker has none
+position volume differs
+position SL/TP differs
+unknown position exists with system magic number
+broker reports partial fill unknown locally
+```
+
+### 24.2 Required Behavior
 
 If mismatch cannot be safely resolved:
 
 ```text
-- halt new orders
-- log critical event
-- alert user
-- require manual review
+halt new orders
+log critical event
+alert user
+require manual review
 ```
 
 ---
 
-## 18. Kill Switch Specification
+## 25. Kill Switch
 
-The system must include multiple kill switch triggers.
+The system MUST include multiple kill switch triggers.
 
-### 18.1 Required Triggers
+### 25.1 Required Triggers
 
 ```text
-- daily loss limit breached
-- weekly loss limit breached
-- max drawdown breached
-- consecutive loss limit breached
-- data stale
-- broker disconnected
-- feature validation failed
-- model/scaler mismatch
-- position state mismatch
-- spread extreme
-- abnormal slippage
-- unexpected exception in live loop
+daily loss limit breached
+weekly loss limit breached
+max drawdown breached
+consecutive loss limit breached
+data stale
+broker disconnected
+feature validation failed
+model/scaler mismatch
+position state mismatch
+spread extreme
+abnormal slippage
+margin level too low
+unexpected exception in live loop
+manual emergency stop file exists
 ```
 
-### 18.2 Kill Switch Behavior
+### 25.2 Kill Switch Actions
 
-Configurable behaviors:
+Allowed actions:
 
 ```text
 HALT_NEW_TRADES
 CLOSE_ALL_SYSTEM_POSITIONS
 REDUCE_POSITION_SIZE
 MANUAL_REVIEW_REQUIRED
+NOTIFY_ONLY
 ```
 
-Default recommended behavior:
+Default behavior:
 
 ```text
 HALT_NEW_TRADES
@@ -1077,32 +1648,58 @@ For critical safety failures:
 HALT_NEW_TRADES + MANUAL_REVIEW_REQUIRED
 ```
 
+For filled-without-stop-loss events:
+
+```text
+attempt SL repair → if fail, close or halt according to emergency policy
+```
+
 ---
 
-## 19. Logging Specification
+## 26. Logging
 
-Logging is mandatory for production-readiness.
+Logging is mandatory.
 
-### 19.1 Log Types
+### 26.1 Log Types
 
 ```text
 system.log
 signals.jsonl
 decisions.jsonl
 orders.jsonl
-trades.jsonl
+fills.jsonl
 positions.jsonl
+trades.jsonl
 risk_events.jsonl
+reconciliation.jsonl
 errors.jsonl
 ```
 
-### 19.2 Decision Log Requirements
+### 26.2 Required Common Fields
 
-Every signal must create a decision log.
-
-Required fields:
+Every structured log record MUST include:
 
 ```text
+timestamp
+run_id
+mode
+symbol if applicable
+strategy_name if applicable
+strategy_version if applicable
+model_version if applicable
+config_hash
+schema_version
+event_type
+severity
+```
+
+### 26.3 Decision Log Fields
+
+Every decision log MUST include:
+
+```text
+decision_id
+signal_id
 timestamp
 symbol
 timeframe
@@ -1110,12 +1707,13 @@ raw_signal
 final_decision
 confidence
 expected_return
-spread
+spread_points
 ATR
 regime
 risk_reward
-position_size
+position_size_lots
 risk_pct
+risk_amount
 filters_passed
 filters_failed
 reason_codes
@@ -1124,19 +1722,20 @@ config_hash
 feature_schema_version
 ```
 
-### 19.3 Trade Log Requirements
+### 26.4 Trade Log Fields
 
-Every completed trade must include:
+Every completed trade MUST include:
 
 ```text
 trade_id
+run_id
 symbol
 side
 entry_time
 entry_price
 exit_time
 exit_price
-position_size
+position_size_lots
 stop_loss
 take_profit
 exit_reason
@@ -1145,167 +1744,393 @@ net_pnl
 commission
 spread_cost
 slippage
+swap
 R_multiple
 holding_bars
+holding_time
 model_version
+strategy_version
 config_hash
 ```
 
 ---
 
-## 20. Storage Specification
+## 27. Storage
 
-For production-oriented use, the system should persist state.
+The system SHOULD persist state in SQLite for local production-oriented use.
 
-Recommended local storage:
+Migration to PostgreSQL MAY be added later.
 
-```text
-SQLite
-```
-
-### 20.1 Required Tables
+### 27.1 Required Tables
 
 ```text
+runs
 signals
 decisions
 orders
+fills
 positions
 trades
 risk_events
 system_events
+reconciliation_events
 model_versions
 config_versions
+symbol_registry_snapshots
 ```
 
-### 20.2 Reproducibility Metadata
+### 27.2 Reproducibility Metadata
 
-Each backtest and live run should store:
+Each run MUST store:
 
 ```text
 run_id
 git_commit
 config_hash
+config_path
 model_version
+model_hash
 scaler_version
+scaler_hash
 feature_schema_version
 data_range
 symbol_universe
 execution_mode
-start_time
-end_time
+started_at
+ended_at
+status
+```
+
+### 27.3 State Recovery
+
+On startup in live-capable modes, the system MUST:
+
+```text
+load last known local positions
+fetch broker positions
+run reconciliation
+refuse new orders until reconciliation passes
 ```
 
 ---
 
-## 21. Monitoring Specification
+## 28. Monitoring
 
-The dashboard or monitoring layer must answer:
+The monitoring layer MUST answer:
 
 ```text
 Is the system online?
 Is MT5 connected?
 Is market data fresh?
+What mode is running?
 What positions are open?
 How much risk is currently used?
 What was the latest signal?
 Why were recent signals rejected?
 Is the kill switch active?
 What model/config version is running?
+What is today's realized and unrealized PnL?
+Are there reconciliation warnings?
 ```
 
-### 21.1 Recommended Dashboard Panels
+### 28.1 Recommended Dashboard Panels
 
 ```text
 System Health
+Broker Connection
 Market Data Status
 Open Positions
 Risk Budget
 Latest Signals
 Rejected Signals
+Orders/Fills
 Model Version
+Config Hash
 Kill Switch Status
 Daily Performance
+Reconciliation Status
+```
+
+### 28.2 Alert Conditions
+
+The system SHOULD alert on:
+
+```text
+kill switch activated
+broker disconnected
+data stale
+position mismatch
+filled order without SL/TP
+daily loss threshold near breach
+abnormal slippage
+unexpected exception
 ```
 
 ---
 
-## 22. Configuration Specification
+## 29. Configuration
 
-All trading behavior must be configurable, not hardcoded.
+All trading behavior MUST be configurable, not hardcoded.
 
-### 22.1 Required Config Groups
+### 29.1 Example Config
 
 ```yaml
 mode:
-  name: conservative
+  name: backtest
+  live_confirm_required: true
+
+account:
+  expected_account_id: 12345678
+  expected_server: Demo-Server
+  account_currency: USD
 
 symbols:
   enabled: [XAUUSDm, EURUSDm, USTECm]
+  registry_path: configs/symbols.yaml
 
-risk:
-  risk_per_trade: 0.0025
-  daily_loss_limit: 0.01
-  max_open_positions: 2
-  max_correlation: 0.7
-  max_lot: 0.10
+timeframes:
+  primary: M15
+  confirmations: [H1, H4]
+
+data:
+  source: csv
+  timezone: broker
+  timestamp_semantics: candle_open_time
+  missing_bar_policy: warn
+  max_missing_bar_ratio: 0.001
+
+features:
+  schema_version: features_v3
+  use_closed_candles_only: true
+
+strategy:
+  name: triple_barrier_lstm
+  version: 0.5.0
+  source: ml_model
 
 signal:
   buy_threshold: 0.60
   sell_threshold: 0.60
   min_rr: 1.5
 
+risk:
+  profile: conservative
+  risk_per_trade: 0.0025
+  daily_loss_limit: 0.01
+  weekly_loss_limit: 0.02
+  max_open_positions: 2
+  max_symbol_exposure: 0.005
+  max_correlation: 0.7
+  max_lot: 0.10
+  min_lot_policy: reject
+
 execution:
-  order_type: market
+  broker: mt5
+  order_type: MARKET
   max_spread_multiplier: 2.5
-  slippage_model: base
+  deviation_points: 20
+  retry_count: 2
+  require_sl: true
+  auto_close_if_sl_missing: false
 
 backtest:
   initial_equity: 10000
   commission_per_lot: 0
   same_bar_policy: conservative
+  slippage_model: base
+  execute_on_next_open: true
+
+exit:
+  time_stop_bars: 24
+  time_stop_action: close
+
+logging:
+  output_dir: logs
+  structured: true
+  level: INFO
+
+storage:
+  type: sqlite
+  path: data/ml_trade.sqlite
 ```
 
-### 22.2 Config Hash
+### 29.2 Config Hash
 
-Each run must compute a config hash and store it in logs.
+Each run MUST compute and store a config hash.
+
+The hash MUST include:
+
+```text
+strategy config
+risk config
+execution config
+symbol universe
+timeframe config
+feature schema version
+model/scaler identifiers if applicable
+```
 
 ---
 
-## 23. Baseline Strategy Requirements
+## 30. Testing Requirements
 
-The platform must include simple baseline strategies for comparison.
+### 30.1 Unit Tests
 
-Required baselines:
+MUST cover:
 
 ```text
-buy and hold
-random entry with same exit rules
-moving average crossover
-RSI mean reversion
-ATR breakout
+data validation
+symbol registry loading
+feature schema validation
+position sizing
+lot rounding
+risk limit checks
+signal validation
+filter outputs
+order construction
+same-bar TP/SL resolution
+metric calculation
+config hashing
 ```
 
-The main strategy must be compared against these baselines.
+### 30.2 Integration Tests
 
-A model-based system is not considered validated unless it beats or improves upon relevant baselines after realistic costs.
+MUST cover:
+
+```text
+CSV data → features → signals → decisions → backtest report
+strategy signal → risk engine → order request
+live startup → broker positions → reconciliation
+paper order submission through broker adapter mock
+kill switch activation
+```
+
+### 30.3 Regression Tests
+
+MUST include at least one fixed historical dataset and config where:
+
+```text
+trade count is deterministic
+equity curve hash is deterministic
+report metrics are deterministic within tolerance
+```
+
+### 30.4 Acceptance Criteria
+
+The Algo Trade Core is considered minimally complete when:
+
+```text
+[ ] one baseline strategy runs end-to-end in backtest
+[ ] one model-based strategy can plug into the same interface
+[ ] no-lookahead execution is tested
+[ ] TP/SL/time-stop lifecycle is tested
+[ ] costs are included
+[ ] risk limits can reject trades
+[ ] every signal produces a decision log
+[ ] every completed trade produces a trade log
+[ ] run metadata is persisted
+[ ] backtest report is reproducible
+```
 
 ---
 
-## 24. Resume-Ready Validation Requirements
+## 31. Promotion Gates
 
-To be considered resume-ready, the project should include:
+A strategy/system version may advance only through these gates.
+
+### 31.1 Gate 1 — Research Candidate
 
 ```text
-- architecture diagram
-- backtest report
-- walk-forward report
-- baseline comparison
-- ablation study
-- realistic transaction cost testing
-- robustness testing
-- paper/shadow trading logs
-- risk management documentation
-- deployment instructions
+[ ] data validation passes
+[ ] feature schema is stable
+[ ] baseline comparison exists
+[ ] basic backtest completes
+[ ] result is reproducible
+```
+
+### 31.2 Gate 2 — Backtest Candidate
+
+```text
+[ ] stateful backtest implemented
+[ ] realistic costs included
+[ ] no-lookahead test passes
+[ ] TP/SL/time-stop tested
+[ ] decision and trade logs complete
+[ ] risk engine rejects invalid trades
+```
+
+### 31.3 Gate 3 — Walk-Forward Candidate
+
+```text
+[ ] walk-forward completed
+[ ] OOS results locked
+[ ] parameter tuning excludes test sets
+[ ] scaler/model leakage prevented
+[ ] aggregate report generated
+```
+
+### 31.4 Gate 4 — Shadow Candidate
+
+```text
+[ ] live data ingestion works
+[ ] shadow decisions logged
+[ ] no order submission possible
+[ ] stale data detection works
+[ ] broker connection health monitored
+```
+
+### 31.5 Gate 5 — Paper Candidate
+
+```text
+[ ] paper/demo order submission works
+[ ] post-trade verification works
+[ ] reconciliation works
+[ ] kill switch tested
+[ ] emergency stop tested
+[ ] paper logs match expected lifecycle
+```
+
+### 31.6 Gate 6 — Micro-Live Candidate
+
+```text
+[ ] explicit live confirmation required
+[ ] account ID/server checks pass
+[ ] max risk per trade <= 0.25%
+[ ] daily loss limit <= 1.0%
+[ ] auto halt on critical mismatch
+[ ] manual review process documented
+```
+
+### 31.7 Gate 7 — Live Candidate
+
+```text
+[ ] micro-live results reviewed
+[ ] drawdown within expected range
+[ ] execution slippage acceptable
+[ ] reconciliation stable
+[ ] monitoring and alerts active
+[ ] rollback plan documented
+```
+
+---
+
+## 32. Resume-Ready Requirements
+
+To be resume-ready, the project SHOULD include:
+
+```text
+architecture diagram
+clean README
+reproducible backtest report
+walk-forward report
+baseline comparison
+ablation study
+realistic transaction cost testing
+robustness testing
+paper/shadow trading logs
+risk management documentation
+deployment instructions
+screenshots or dashboard demo
 ```
 
 Recommended documents:
@@ -1318,122 +2143,131 @@ BACKTESTING.md
 RISK.md
 DEPLOYMENT.md
 RESEARCH_REPORT.md
+RUNBOOK.md
 ```
 
----
-
-## 25. Production Candidate Checklist
-
-A strategy/system version can be marked as production candidate only if:
+Resume claim SHOULD be framed as:
 
 ```text
-[ ] Data validation passes
-[ ] Feature schema validation passes
-[ ] Model/scaler hash validation passes
-[ ] Backtest is reproducible
-[ ] Walk-forward test completed
-[ ] Out-of-sample result locked
-[ ] Realistic costs included
-[ ] Slippage stress test completed
-[ ] Spread stress test completed
-[ ] Monte Carlo robustness test completed
-[ ] Baseline comparison completed
-[ ] Ablation study completed
-[ ] Risk limits configured
-[ ] Kill switch tested
-[ ] Shadow mode tested
-[ ] Paper mode tested
-[ ] MT5 state reconciliation tested
-[ ] Decision logging enabled
-[ ] Trade logging enabled
-[ ] Dashboard/monitoring available
-[ ] Emergency stop mechanism available
+Built a production-oriented algorithmic trading research and execution platform with stateful backtesting, risk controls, walk-forward validation, MT5 integration, decision logging, and reproducible performance reporting.
+```
+
+Avoid claiming:
+
+```text
+Built profitable AI trading bot
+Guaranteed trading system
+Institutional-grade HFT platform
 ```
 
 ---
 
-## 26. Recommended Development Priority
+## 33. Development Priority
 
 ### Priority 1 — Correctness
 
 ```text
-Data validation
-Feature schema lock
-Model/scaler hash check
-No-lookahead backtest
-Stateful TP/SL/timeout simulation
+data validation
+feature schema lock
+model/scaler hash check
+no-lookahead backtest
+stateful TP/SL/timeout simulation
+config hash
+regression test
 ```
 
 ### Priority 2 — Risk Safety
 
 ```text
-Fractional Kelly only
-Risk caps
-Daily loss limit
-Max position limit
-Correlation cap
-Kill switch
+fixed fractional risk
+risk caps
+daily loss limit
+max position limit
+correlation cap
+required SL
+kill switch
 ```
 
 ### Priority 3 — Observability
 
 ```text
-Decision logs
-Rejected signal logs
-Trade logs
-Risk event logs
-System health logs
+decision logs
+rejected signal logs
+order/fill logs
+trade logs
+risk event logs
+system health logs
+reconciliation logs
 ```
 
 ### Priority 4 — Realism
 
 ```text
-Spread model
-Slippage model
-Commission/swap
-Session filters
-News-time stress
+spread model
+slippage model
+commission/swap
+session filters
+same-bar policy
+news-time stress
 ```
 
 ### Priority 5 — Research Quality
 
 ```text
-Walk-forward testing
-Baseline comparison
-Ablation study
-Robustness testing
-Paper trading comparison
+walk-forward testing
+baseline comparison
+ablation study
+robustness testing
+paper/shadow comparison
 ```
 
----
-
-## 27. Non-Goals
-
-The Algo Trade core does not need to solve these directly:
+### Priority 6 — Live Readiness
 
 ```text
-- predicting exact next candle OHLC
-- guaranteeing profit
-- fully autonomous online learning in live mode
-- high-frequency trading latency optimization
-- exchange co-location
-- institutional order book execution
+MT5 adapter hardening
+state reconciliation
+idempotent orders
+emergency stop
+monitoring dashboard
+runbook
 ```
-
-The immediate goal is a robust solo-developer quant trading platform, not a hedge fund execution stack.
 
 ---
 
-## 28. Design Principle
+## 34. Non-Goals
+
+The Algo Trade Core does not need to solve:
+
+```text
+predicting exact next candle OHLC
+guaranteeing profit
+fully autonomous online learning in live mode
+high-frequency trading latency optimization
+exchange co-location
+institutional order book execution
+market making
+latency arbitrage
+```
+
+Immediate goal:
+
+```text
+A robust solo-developer quant trading platform that is reproducible, risk-controlled, observable, and honest about uncertainty.
+```
+
+---
+
+## 35. Design Principles
 
 The system should optimize for:
 
 ```text
-Reliability over complexity
-Reproducibility over beautiful backtests
-Risk control over high win rate
-Debuggability over magical AI behavior
-Survivability over aggression
+reliability over complexity
+reproducibility over beautiful backtests
+risk control over high win rate
+debuggability over magical AI behavior
+survivability over aggression
+boring correctness over clever failure
 ```
 
 Final principle:

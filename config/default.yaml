@@ -54,3 +54,18 @@ shadow:
   broker: mt5
   send_orders: false
   poll_seconds: 60
+
+real_data:
+  source: mt5
+  bars: 250
+  missing_bars_allowed: 0
+  allow_session_gaps: true
+  max_session_gap_minutes: 180
+
+execution:
+  broker: mt5
+  env_path: .env
+  send_orders: false
+  paper_equity: 10000
+  live_enabled: false
+  confirm_live: ""

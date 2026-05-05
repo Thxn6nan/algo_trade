@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -9,8 +10,7 @@ from typing import Any
 import yaml
 
 
-SUPPORTED_SAFE_MODES = {"research", "backtest", "walk_forward", "shadow"}
-UNIMPLEMENTED_ORDER_MODES = {"paper", "live"}
+SUPPORTED_MODES = {"research", "backtest", "walk_forward", "shadow", "paper", "live"}
 
 
 @dataclass(frozen=True)
@@ -44,20 +44,31 @@ def load_config(path: str | Path) -> AppConfig:
     return AppConfig(raw=raw, path=config_path, config_hash=hash_config(raw))
 
 
+def with_mode(config: AppConfig, mode: str) -> AppConfig:
+    raw = deepcopy(config.raw)
+    raw.setdefault("mode", {})["name"] = mode
+    validate_config(raw)
+    return AppConfig(raw=raw, path=config.path, config_hash=hash_config(raw))
+
+
 def validate_config(raw: dict[str, Any]) -> None:
-    required_groups = ["mode", "symbols", "risk", "signal", "backtest", "shadow"]
+    required_groups = ["mode", "symbols", "risk", "signal", "backtest", "shadow", "execution", "real_data"]
     missing = [group for group in required_groups if group not in raw]
     if missing:
         raise ValueError(f"Missing config groups: {missing}")
 
     mode = raw["mode"].get("name")
-    if mode in UNIMPLEMENTED_ORDER_MODES:
-        raise ValueError(f"Mode {mode!r} is intentionally unavailable in this phase")
-    if mode not in SUPPORTED_SAFE_MODES:
+    if mode not in SUPPORTED_MODES:
         raise ValueError(f"Unsupported mode {mode!r}")
 
     if raw["shadow"].get("send_orders") is not False:
-        raise ValueError("shadow.send_orders must be false in this phase")
+        raise ValueError("shadow.send_orders must be false")
+
+    execution = raw["execution"]
+    if mode == "paper" and execution.get("send_orders") is not False:
+        raise ValueError("paper mode requires execution.send_orders=false")
+    if mode == "live" and execution.get("send_orders") is not True:
+        raise ValueError("live mode requires execution.send_orders=true")
 
     enabled = raw["symbols"].get("enabled") or []
     registry = raw["symbols"].get("registry") or {}

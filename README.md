@@ -2,13 +2,14 @@
 
 Algorithmic trading core for a solo-developer quant platform.
 
-The project currently implements a **Python modular CLI** for **Backtest + Shadow mode** targeting **MT5 CFD/FX-style instruments**. The goal is not to chase a beautiful backtest. The goal is to build a trading system that validates data, prevents lookahead mistakes, forces risk checks, logs every decision, and can later grow toward paper/live execution safely.
+The project currently implements a **Python modular CLI** for **Backtest, Shadow, Paper, and guarded Live mode** targeting **MT5 CFD/FX-style instruments**. The goal is not to chase a beautiful backtest. The goal is to build a trading system that validates data, prevents lookahead mistakes, forces risk checks, logs every decision, and can grow toward broker execution safely.
 
 ## Scope
 
 In scope now:
 
 - Historical OHLCV data loading from CSV
+- Real MT5 bar reads for paper/live runs
 - Market data validation
 - Technical feature pipeline
 - Feature schema lock
@@ -21,11 +22,11 @@ In scope now:
 - JSONL and SQLite logs
 - Performance reporting
 - Shadow-mode safety shell with order submission disabled
+- Paper-mode decision/order logging without broker submission
+- Live-mode MT5 order submission behind explicit config and `.env` guards
 
 Out of scope for the current phase:
 
-- Live order submission
-- Paper trading order submission
 - Online learning
 - High-frequency trading infrastructure
 - Exchange co-location
@@ -41,9 +42,9 @@ research
 backtest
 walk_forward
 shadow
+paper
+live
 ```
-
-`paper` and `live` are intentionally unavailable in this phase.
 
 Backtest safety defaults:
 
@@ -56,6 +57,11 @@ Shadow safety defaults:
 
 - `shadow.send_orders` must be `false`.
 - The execution adapter raises if order submission is attempted.
+
+Paper/live safety defaults:
+
+- `paper` uses MT5 market data and records paper orders only.
+- `live` requires `execution.send_orders: true`, `execution.live_enabled: true`, `execution.confirm_live: I_UNDERSTAND_LIVE_TRADING_RISK`, and `SYSTEM_MODE=live` in `.env`.
 
 ## Project Layout
 
@@ -98,6 +104,14 @@ Run shadow safety mode:
 python run.py --mode shadow --symbol XAUUSDm --timeframe M15
 ```
 
+Run one paper cycle against MT5 data:
+
+```bash
+python run.py --mode paper --symbol XAUUSDm --timeframe M15
+```
+
+Live mode uses the same command shape, but only after the live guards in `config/default.yaml` and `.env` are deliberately enabled.
+
 Outputs are written under `runs/<run_id>/`.
 
 ## Configuration
@@ -118,6 +132,9 @@ Important groups:
 - `filters`: spread and volatility filters
 - `backtest`: initial equity, execution policy, cost model
 - `shadow`: broker target and order-sending safety flag
+- `real_data`: MT5 bar count and real-data validation tolerance
+- `real_data.allow_session_gaps`: allows normal broker weekend/session gaps and short daily maintenance gaps while still rejecting unexpected weekday gaps above tolerance
+- `execution`: paper/live broker settings and live-trading guards
 
 ## Contributing Guidelines
 

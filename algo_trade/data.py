@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
+
+from algo_trade.mt5_gateway import MT5Gateway
 
 REQUIRED_COLUMNS = ["timestamp", "symbol", "timeframe", "open", "high", "low", "close", "volume", "spread"]
 
@@ -23,11 +26,14 @@ class HistoricalDataProvider:
 
 
 class MT5MarketDataProvider:
-    """Shadow-only adapter placeholder.
+    """Market data reads backed by MT5.
 
-    This object deliberately exposes market data reads only. Order submission lives
-    behind the execution adapter and is guarded out of this phase.
+    Order submission stays behind the execution adapter so signal/risk code cannot
+    accidentally send broker orders while fetching market data.
     """
 
-    def latest_bars(self, symbol: str, timeframe: str, count: int = 250) -> pd.DataFrame:
-        raise NotImplementedError("MT5 data reads are not wired in this skeleton yet")
+    def __init__(self, gateway: Any | None = None, env_path: str = ".env"):
+        self.gateway = gateway or MT5Gateway(env_path=env_path)
+
+    def latest_bars(self, symbol: str, timeframe: str, count: int = 250, include_current: bool = False) -> pd.DataFrame:
+        return self.gateway.latest_bars(symbol, timeframe, count=count, include_current=include_current)
