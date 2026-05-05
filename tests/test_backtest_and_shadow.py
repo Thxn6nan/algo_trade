@@ -120,6 +120,28 @@ class BacktestAndShadowTest(unittest.TestCase):
                 connection.close()
             self.assertTrue({"fills", "reconciliation_events", "model_versions", "symbol_registry_snapshots"}.issubset(tables))
 
+    def test_backtest_reports_percentage_progress_when_callback_is_provided(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config("config/default.yaml")
+            config.raw["paths"]["output_dir"] = temp_dir
+            config.raw["data"].update({"allow_sample_data": True, "require_real_data": False, "min_bars": 1})
+            registry = SymbolRegistry.from_config(config.raw["symbols"])
+            progress_events: list[dict[str, object]] = []
+
+            BacktestEngine(
+                config,
+                registry,
+                AlwaysBuyStrategy(),
+                progress_callback=progress_events.append,
+                progress_step_percent=50,
+                progress_label="primary backtest",
+            ).run(load_sample(), "XAUUSDm")
+
+            self.assertTrue(progress_events)
+            self.assertEqual(progress_events[0]["percent"], 0)
+            self.assertEqual(progress_events[-1]["percent"], 100)
+            self.assertEqual(progress_events[-1]["label"], "primary backtest")
+
     def test_edge_evidence_fails_when_trade_count_is_not_enough(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config = load_config("config/default.yaml")
@@ -143,6 +165,39 @@ class BacktestAndShadowTest(unittest.TestCase):
             self.assertEqual(evidence.verdict, "FAIL")
             self.assertIn("minimum_trades", evidence.reasons)
             self.assertTrue((Path(result.run_dir) / "edge_evidence.jsonl").exists())
+
+    def test_edge_evidence_reports_baseline_progress_when_callback_is_provided(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config("config/default.yaml")
+            config.raw["paths"]["output_dir"] = temp_dir
+            config.raw["data"].update({"allow_sample_data": True, "require_real_data": False, "min_bars": 1})
+            config.raw["edge"].update(
+                {
+                    "min_bars": 1,
+                    "require_real_data": False,
+                    "require_beats_baselines": True,
+                    "require_stress_expectancy_positive": False,
+                    "baselines": ["no_trade"],
+                    "stress_slippage_models": [],
+                }
+            )
+            registry = SymbolRegistry.from_config(config.raw["symbols"])
+            frame = load_sample()
+            result = BacktestEngine(config, registry, AlwaysBuyStrategy()).run(frame, "XAUUSDm")
+            progress_events: list[dict[str, object]] = []
+
+            build_edge_evidence(
+                config,
+                registry,
+                frame,
+                "XAUUSDm",
+                AlwaysBuyStrategy(),
+                result,
+                progress_callback=progress_events.append,
+                progress_step_percent=100,
+            )
+
+            self.assertIn("baseline no_trade", {event["label"] for event in progress_events})
 
     def test_same_bar_policy_is_conservative_sl_first(self):
         with tempfile.TemporaryDirectory() as temp_dir:

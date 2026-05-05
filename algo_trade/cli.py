@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from algo_trade.backtest import BacktestEngine
@@ -14,6 +15,21 @@ from algo_trade.shadow import ShadowRunner
 from algo_trade.strategies import get_strategy
 from algo_trade.symbols import SymbolRegistry
 from algo_trade.walk_forward import run_walk_forward
+
+
+class ProgressPrinter:
+    def __init__(self) -> None:
+        self._last_percent_by_label: dict[str, int] = {}
+
+    def __call__(self, event: dict[str, object]) -> None:
+        label = str(event.get("label", "progress"))
+        percent = int(event.get("percent", 0))
+        if self._last_percent_by_label.get(label) == percent:
+            return
+        self._last_percent_by_label[label] = percent
+        current = int(event.get("current", 0))
+        total = int(event.get("total", 0))
+        print(f"{label}: {percent}% ({current}/{total})", file=sys.stderr, flush=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -41,9 +57,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if config.mode in {"backtest", "research"}:
+        progress = ProgressPrinter()
         frame = load_backtest_data(config, symbol, args.timeframe)
-        result = BacktestEngine(config, registry, strategy).run(frame, symbol)
-        edge_evidence = build_edge_evidence(config, registry, frame, symbol, strategy, result)
+        result = BacktestEngine(
+            config,
+            registry,
+            strategy,
+            progress_callback=progress,
+            progress_label="primary backtest",
+        ).run(frame, symbol)
+        edge_evidence = build_edge_evidence(config, registry, frame, symbol, strategy, result, progress_callback=progress)
         print(
             json.dumps(
                 {

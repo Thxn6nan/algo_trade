@@ -3,7 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -50,6 +50,8 @@ def build_edge_evidence(
     symbol_name: str,
     strategy: Strategy,
     primary_result: BacktestResult,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
+    progress_step_percent: int = 5,
 ) -> EdgeEvidence:
     edge_config = config.raw.get("edge", {})
     if edge_config.get("enabled", True) is False:
@@ -61,14 +63,30 @@ def build_edge_evidence(
     for baseline_name in edge_config.get("baselines", []):
         if baseline_name == strategy.name:
             continue
-        baseline_result = BacktestEngine(config, registry, get_strategy(baseline_name), record_events=False).run(frame.copy(), symbol_name)
+        baseline_result = BacktestEngine(
+            config,
+            registry,
+            get_strategy(baseline_name),
+            record_events=False,
+            progress_callback=progress_callback,
+            progress_step_percent=progress_step_percent,
+            progress_label=f"baseline {baseline_name}",
+        ).run(frame.copy(), symbol_name)
         baseline_reports[baseline_name] = baseline_result.report
 
     stress_reports: dict[str, PerformanceReport] = {}
     for slippage_model in edge_config.get("stress_slippage_models", []):
         stress_config = _with_backtest_override(config, {"slippage_model": slippage_model})
         stress_strategy = get_strategy(strategy.name)
-        stress_result = BacktestEngine(stress_config, registry, stress_strategy, record_events=False).run(frame.copy(), symbol_name)
+        stress_result = BacktestEngine(
+            stress_config,
+            registry,
+            stress_strategy,
+            record_events=False,
+            progress_callback=progress_callback,
+            progress_step_percent=progress_step_percent,
+            progress_label=f"stress {slippage_model}",
+        ).run(frame.copy(), symbol_name)
         stress_reports[str(slippage_model)] = stress_result.report
 
     evidence = _assess(config, frame, primary_result, baseline_reports, stress_reports)

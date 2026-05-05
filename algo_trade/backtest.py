@@ -4,6 +4,7 @@ import uuid
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import pandas as pd
 
@@ -35,11 +36,23 @@ class BacktestResult:
 
 
 class BacktestEngine:
-    def __init__(self, config: AppConfig, registry: SymbolRegistry, strategy: Strategy, record_events: bool = True):
+    def __init__(
+        self,
+        config: AppConfig,
+        registry: SymbolRegistry,
+        strategy: Strategy,
+        record_events: bool = True,
+        progress_callback: Callable[[dict[str, object]], None] | None = None,
+        progress_step_percent: int = 5,
+        progress_label: str | None = None,
+    ):
         self.config = config
         self.registry = registry
         self.strategy = strategy
         self.record_events = record_events
+        self.progress_callback = progress_callback
+        self.progress_step_percent = max(1, min(int(progress_step_percent), 100))
+        self.progress_label = progress_label or f"backtest {strategy.name}"
 
     def run(self, frame: pd.DataFrame, symbol_name: str) -> BacktestResult:
         self._enforce_data_evidence(frame, symbol_name)
@@ -147,92 +160,108 @@ class BacktestEngine:
         signals_for_viability: list[Signal] = []
         decisions_for_viability: list[TradeDecision] = []
         position: Position | None = None
+        total_iterations = max(len(data) - 1, 1)
+        next_progress_threshold = self.progress_step_percent
+
+        self._emit_progress(0, 0, total_iterations)
+
+        def report_progress(current: int) -> None:
+            nonlocal next_progress_threshold
+            percent = int((current / total_iterations) * 100)
+            while next_progress_threshold < 100 and percent >= next_progress_threshold:
+                self._emit_progress(next_progress_threshold, current, total_iterations)
+                next_progress_threshold += self.progress_step_percent
+            if current >= total_iterations:
+                self._emit_progress(100, total_iterations, total_iterations)
 
         for index in range(0, len(data) - 1):
-            row = data.iloc[index]
-            next_row = data.iloc[index + 1]
-            timestamp = row["timestamp"]
-            if position is not None:
-                closed_trade = self._maybe_close(position, row, symbol, equity)
-                if closed_trade is not None:
-                    equity += closed_trade.net_pnl
-                    trades.append(closed_trade)
-                    recorder.record("trades", "trades", closed_trade.to_record(), closed_trade.exit_time.isoformat())
-                    position = None
+            try:
+                row = data.iloc[index]
+                next_row = data.iloc[index + 1]
+                timestamp = row["timestamp"]
+                if position is not None:
+                    closed_trade = self._maybe_close(position, row, symbol, equity)
+                    if closed_trade is not None:
+                        equity += closed_trade.net_pnl
+                        trades.append(closed_trade)
+                        recorder.record("trades", "trades", closed_trade.to_record(), closed_trade.exit_time.isoformat())
+                        position = None
 
-            signal = self.strategy.generate(row)
-            signals_for_viability.append(signal)
-            recorder.record("signals", "signals", signal.to_record(), signal.timestamp.isoformat())
-            if position is not None:
-                decision = self._blocked_by_position_decision(signal, position)
+                signal = self.strategy.generate(row)
+                signals_for_viability.append(signal)
+                recorder.record("signals", "signals", signal.to_record(), signal.timestamp.isoformat())
+                if position is not None:
+                    decision = self._blocked_by_position_decision(signal, position)
+                    decisions_for_viability.append(decision)
+                    recorder.record("decisions", "decisions", decision.to_record(), decision.timestamp.isoformat())
+                    rejected_reasons.extend(decision.reasons)
+                    equity_points.append((timestamp, equity))
+                    continue
+
+                entry_price = float(next_row["open"])
+                decision = decisions.decide(signal, symbol, equity, entry_price, 0)
                 decisions_for_viability.append(decision)
                 recorder.record("decisions", "decisions", decision.to_record(), decision.timestamp.isoformat())
-                rejected_reasons.extend(decision.reasons)
+                if decision.status == DecisionStatus.REJECTED:
+                    rejected_reasons.extend(decision.reasons)
+                if decision.status == DecisionStatus.APPROVED and decision.stop_loss is not None and decision.take_profit is not None:
+                    position = Position(
+                        trade_id=f"tr-{uuid.uuid4().hex[:12]}",
+                        symbol=symbol.name,
+                        side=decision.side,
+                        entry_time=next_row["timestamp"].to_pydatetime(),
+                        entry_price=entry_price,
+                        volume=decision.position_size,
+                        stop_loss=decision.stop_loss,
+                        take_profit=decision.take_profit,
+                        state=TradeState.POSITION_OPEN,
+                        metadata=signal.metadata.copy(),
+                    )
+                    recorder.record(
+                        "orders",
+                        "orders",
+                        {
+                            "trade_id": position.trade_id,
+                            "symbol": position.symbol,
+                            "side": position.side.value,
+                            "order_type": "SIMULATED_MARKET",
+                            "entry_price": position.entry_price,
+                            "stop_loss": position.stop_loss,
+                            "take_profit": position.take_profit,
+                        },
+                        position.entry_time.isoformat(),
+                    )
+                    recorder.record(
+                        "fills",
+                        "fills",
+                        {
+                            "trade_id": position.trade_id,
+                            "symbol": position.symbol,
+                            "side": position.side.value,
+                            "fill_price": position.entry_price,
+                            "volume": position.volume,
+                            "state": TradeState.ORDER_FILLED.value,
+                        },
+                        position.entry_time.isoformat(),
+                    )
+                    recorder.record(
+                        "positions",
+                        "positions",
+                        {
+                            "trade_id": position.trade_id,
+                            "symbol": position.symbol,
+                            "side": position.side.value,
+                            "entry_price": position.entry_price,
+                            "volume": position.volume,
+                            "stop_loss": position.stop_loss,
+                            "take_profit": position.take_profit,
+                            "state": position.state.value,
+                        },
+                        position.entry_time.isoformat(),
+                    )
                 equity_points.append((timestamp, equity))
-                continue
-
-            entry_price = float(next_row["open"])
-            decision = decisions.decide(signal, symbol, equity, entry_price, 0)
-            decisions_for_viability.append(decision)
-            recorder.record("decisions", "decisions", decision.to_record(), decision.timestamp.isoformat())
-            if decision.status == DecisionStatus.REJECTED:
-                rejected_reasons.extend(decision.reasons)
-            if decision.status == DecisionStatus.APPROVED and decision.stop_loss is not None and decision.take_profit is not None:
-                position = Position(
-                    trade_id=f"tr-{uuid.uuid4().hex[:12]}",
-                    symbol=symbol.name,
-                    side=decision.side,
-                    entry_time=next_row["timestamp"].to_pydatetime(),
-                    entry_price=entry_price,
-                    volume=decision.position_size,
-                    stop_loss=decision.stop_loss,
-                    take_profit=decision.take_profit,
-                    state=TradeState.POSITION_OPEN,
-                    metadata=signal.metadata.copy(),
-                )
-                recorder.record(
-                    "orders",
-                    "orders",
-                    {
-                        "trade_id": position.trade_id,
-                        "symbol": position.symbol,
-                        "side": position.side.value,
-                        "order_type": "SIMULATED_MARKET",
-                        "entry_price": position.entry_price,
-                        "stop_loss": position.stop_loss,
-                        "take_profit": position.take_profit,
-                    },
-                    position.entry_time.isoformat(),
-                )
-                recorder.record(
-                    "fills",
-                    "fills",
-                    {
-                        "trade_id": position.trade_id,
-                        "symbol": position.symbol,
-                        "side": position.side.value,
-                        "fill_price": position.entry_price,
-                        "volume": position.volume,
-                        "state": TradeState.ORDER_FILLED.value,
-                    },
-                    position.entry_time.isoformat(),
-                )
-                recorder.record(
-                    "positions",
-                    "positions",
-                    {
-                        "trade_id": position.trade_id,
-                        "symbol": position.symbol,
-                        "side": position.side.value,
-                        "entry_price": position.entry_price,
-                        "volume": position.volume,
-                        "stop_loss": position.stop_loss,
-                        "take_profit": position.take_profit,
-                        "state": position.state.value,
-                    },
-                    position.entry_time.isoformat(),
-                )
-            equity_points.append((timestamp, equity))
+            finally:
+                report_progress(index + 1)
 
         if position is not None:
             final_row = data.iloc[-1]
@@ -260,6 +289,19 @@ class BacktestEngine:
             data_quality=quality,
             symbol_audit=symbol_audit,
             strategy_viability=viability,
+        )
+
+    def _emit_progress(self, percent: int, current: int, total: int) -> None:
+        if self.progress_callback is None:
+            return
+        self.progress_callback(
+            {
+                "label": self.progress_label,
+                "strategy": self.strategy.name,
+                "percent": int(percent),
+                "current": int(current),
+                "total": int(total),
+            }
         )
 
     def _persist_broker_metadata_snapshot(self, frame: pd.DataFrame, run_dir: Path) -> None:
