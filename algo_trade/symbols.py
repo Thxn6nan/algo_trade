@@ -30,6 +30,8 @@ class SymbolSpec:
     stop_level_points: int = 0
     freeze_level_points: int = 0
     max_spread_points: float | None = None
+    metadata_confirmed: bool = False
+    metadata_source: str = "config"
     enabled: bool = True
 
     @classmethod
@@ -60,6 +62,8 @@ class SymbolSpec:
             stop_level_points=int(raw.get("stop_level_points", 0)),
             freeze_level_points=int(raw.get("freeze_level_points", 0)),
             max_spread_points=float(raw["max_spread_points"]) if raw.get("max_spread_points") is not None else None,
+            metadata_confirmed=bool(raw.get("metadata_confirmed", False)),
+            metadata_source=str(raw.get("metadata_source", "config")),
             enabled=bool(raw.get("enabled", True)),
         )
 

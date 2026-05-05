@@ -161,6 +161,7 @@ class Position:
     take_profit: float
     state: TradeState = TradeState.POSITION_OPEN
     holding_bars: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -187,6 +188,10 @@ class Trade:
     config_hash: str
     strategy_version: str = "0.1.0"
     swap: float = 0.0
+    entry_session: str | None = None
+    entry_trend_regime: str | None = None
+    entry_range_regime: str | None = None
+    entry_spread_percentile_session: float | None = None
 
     def to_record(self) -> dict[str, Any]:
         record = asdict(self)

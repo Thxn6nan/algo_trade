@@ -24,6 +24,7 @@ class DataQualityReport:
     p95_spread: float
     timezone: str
     source: str = "unknown"
+    source_path: str | None = None
     timestamp_semantics: str = "candle_open_time"
     validation_status: str = "passed"
 
@@ -37,6 +38,7 @@ def validate_ohlcv(
     allow_session_gaps: bool = False,
     max_session_gap_minutes: int = 180,
     source: str = "unknown",
+    source_path: str | None = None,
     timestamp_semantics: str = "candle_open_time",
 ) -> DataQualityReport:
     missing_columns = [column for column in REQUIRED_COLUMNS if column not in frame.columns]
@@ -104,6 +106,7 @@ def validate_ohlcv(
         p95_spread=float(numeric["spread"].quantile(0.95)),
         timezone=timezone,
         source=source,
+        source_path=source_path,
         timestamp_semantics=timestamp_semantics,
     )
 

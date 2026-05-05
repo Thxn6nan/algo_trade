@@ -32,13 +32,18 @@ symbols:
       magic: 7001
       pip_size: 0.01
       pip_value: 1.0
+      tick_size: 0.01
+      tick_value: 1.0
       contract_size: 100
       min_lot: 0.01
       max_lot: 1.0
       lot_step: 0.01
-      average_spread: 18
+      average_spread: 160
+      max_spread_points: 280
       trading_session: "24x5"
       broker_suffix: "m"
+      metadata_confirmed: false
+      metadata_source: config
 
 risk:
   profile: conservative
@@ -60,7 +65,16 @@ signal:
 
 filters:
   max_spread_multiplier: 2.5
+  max_spread_percentile: 0.95
   min_atr: 0.0
+
+session_filters:
+  allowed_sessions: [Asia, London, NewYork]
+  exclude_rollover: true
+
+regime_filters:
+  allowed_trend_regimes: []
+  allowed_range_regimes: []
 
 backtest:
   initial_equity: 10000
@@ -80,9 +94,42 @@ edge:
   min_expectancy: 0.0
   max_drawdown: 0.20
   require_beats_baselines: true
-  baselines: [no_trade, random_entry, ma_crossover]
+  baselines: [no_trade, random_entry, ma_crossover, atr_breakout, session_breakout]
   require_stress_expectancy_positive: true
   stress_slippage_models: [bad, stress]
+
+symbol_audit:
+  require_broker_metadata: true
+  max_spread_median_to_config_ratio: 3.0
+
+strategy_library:
+  rule_based_only: true
+  disabled: [model_probability]
+
+strategy_viability:
+  min_raw_signals: 100
+  min_approved_trades: 30
+  max_rejection_rate: 0.95
+  require_both_sides: false
+
+walk_forward:
+  train_months: 12
+  validation_months: 3
+  test_months: 3
+  step_months: 3
+
+robustness:
+  remove_best_n: [1, 3]
+  double_worst_n: [1, 3]
+  monte_carlo_iterations: 100
+  random_seed: 42
+
+reports:
+  edge_report: true
+
+promotion_gates:
+  research_candidate:
+    min_trades: 30
 
 shadow:
   broker: mt5

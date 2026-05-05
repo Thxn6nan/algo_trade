@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from algo_trade.audit import SymbolAuditReport, build_symbol_audit
 from algo_trade.config import AppConfig
 from algo_trade.decisions import DecisionEngine
 from algo_trade.features import build_features, validate_feature_schema
@@ -17,6 +18,7 @@ from algo_trade.strategies import Strategy
 from algo_trade.symbols import SymbolRegistry, SymbolSpec
 from algo_trade.types import DecisionStatus, DecisionType, Position, RunMetadata, Signal, SignalSide, Trade, TradeDecision, TradeState
 from algo_trade.validation import validate_ohlcv
+from algo_trade.viability import StrategyViabilityReport, build_strategy_viability
 
 
 @dataclass(frozen=True)
@@ -26,6 +28,9 @@ class BacktestResult:
     trades: list[Trade]
     equity_curve: pd.Series
     run_dir: Path
+    data_quality: object | None = None
+    symbol_audit: SymbolAuditReport | None = None
+    strategy_viability: StrategyViabilityReport | None = None
 
 
 class BacktestEngine:
@@ -53,6 +58,7 @@ class BacktestEngine:
             allow_session_gaps=bool(data_config.get("allow_session_gaps", False)),
             max_session_gap_minutes=int(data_config.get("max_session_gap_minutes", 180)),
             source=str(self.config.raw.get("data", {}).get("source", "csv")),
+            source_path=str(frame.attrs.get("source_path")) if frame.attrs.get("source_path") else None,
             timestamp_semantics=str(self.config.raw.get("data", {}).get("timestamp_semantics", "candle_open_time")),
         )
         feature_frame = build_features(frame)
@@ -60,6 +66,16 @@ class BacktestEngine:
         data = feature_frame.data
         data["feature_schema_version"] = feature_frame.feature_schema_version
         symbol = self.registry.get(symbol_name)
+        symbol_audit = build_symbol_audit(
+            frame,
+            symbol,
+            timestamp_semantics=str(self.config.raw.get("data", {}).get("timestamp_semantics", "candle_open_time")),
+            broker_metadata=frame.attrs.get("broker_metadata"),
+            max_spread_median_to_config_ratio=float(
+                self.config.raw.get("symbol_audit", {}).get("max_spread_median_to_config_ratio", 3.0)
+            ),
+            require_broker_metadata=bool(self.config.raw.get("symbol_audit", {}).get("require_broker_metadata", True)),
+        )
         run_id = f"bt-{uuid.uuid4().hex[:12]}"
         run_dir = self.config.output_dir / run_id
         recorder = (
@@ -77,13 +93,19 @@ class BacktestEngine:
             )
             recorder.record("system_events", "runs", metadata.to_record())
             recorder.record("system_events", "system_events", {"event": "data_quality", **quality.to_record()})
+            recorder.record("system_events", "system_events", {"event": "symbol_audit", **symbol_audit.to_record()})
             recorder.record("system_events", "config_versions", {"config_hash": self.config.config_hash, "config": self.config.raw})
             recorder.record("system_events", "symbol_registry_snapshots", {"symbols": self.config.raw["symbols"]})
 
             risk = RiskEngine(self.config.raw["risk"], float(self.config.raw["backtest"]["initial_equity"]))
-            filters = SignalFilter(self.config.raw["signal"], self.config.raw.get("filters", {}))
+            filters = SignalFilter(
+                self.config.raw["signal"],
+                self.config.raw.get("filters", {}),
+                self.config.raw.get("session_filters", {}),
+                self.config.raw.get("regime_filters", {}),
+            )
             decisions = DecisionEngine(filters, risk, self.config.raw["backtest"])
-            return self._simulate(data, symbol, risk, decisions, recorder, run_id, run_dir)
+            return self._simulate(data, symbol, risk, decisions, recorder, run_id, run_dir, quality, symbol_audit)
         finally:
             recorder.close()
 
@@ -107,11 +129,15 @@ class BacktestEngine:
         recorder: RunRecorder,
         run_id: str,
         run_dir: Path,
+        quality: object,
+        symbol_audit: SymbolAuditReport,
     ) -> BacktestResult:
         equity = float(self.config.raw["backtest"]["initial_equity"])
         equity_points: list[tuple[pd.Timestamp, float]] = []
         trades: list[Trade] = []
         rejected_reasons: list[str] = []
+        signals_for_viability: list[Signal] = []
+        decisions_for_viability: list[TradeDecision] = []
         position: Position | None = None
 
         for index in range(0, len(data) - 1):
@@ -127,9 +153,11 @@ class BacktestEngine:
                     position = None
 
             signal = self.strategy.generate(row)
+            signals_for_viability.append(signal)
             recorder.record("signals", "signals", signal.to_record(), signal.timestamp.isoformat())
             if position is not None:
                 decision = self._blocked_by_position_decision(signal, position)
+                decisions_for_viability.append(decision)
                 recorder.record("decisions", "decisions", decision.to_record(), decision.timestamp.isoformat())
                 rejected_reasons.extend(decision.reasons)
                 equity_points.append((timestamp, equity))
@@ -137,6 +165,7 @@ class BacktestEngine:
 
             entry_price = float(next_row["open"])
             decision = decisions.decide(signal, symbol, equity, entry_price, 0)
+            decisions_for_viability.append(decision)
             recorder.record("decisions", "decisions", decision.to_record(), decision.timestamp.isoformat())
             if decision.status == DecisionStatus.REJECTED:
                 rejected_reasons.extend(decision.reasons)
@@ -151,6 +180,7 @@ class BacktestEngine:
                     stop_loss=decision.stop_loss,
                     take_profit=decision.take_profit,
                     state=TradeState.POSITION_OPEN,
+                    metadata=signal.metadata.copy(),
                 )
                 recorder.record(
                     "orders",
@@ -210,8 +240,19 @@ class BacktestEngine:
             name="equity",
         )
         report = build_performance_report(trades, equity_curve, rejected_reasons, float(self.config.raw["backtest"]["initial_equity"]))
+        viability = build_strategy_viability(signals_for_viability, decisions_for_viability, self.config.raw.get("strategy_viability", {}))
         recorder.record("system_events", "system_events", {"event": "performance_report", **report.to_record()})
-        return BacktestResult(run_id=run_id, report=report, trades=trades, equity_curve=equity_curve, run_dir=run_dir)
+        recorder.record("system_events", "system_events", {"event": "strategy_viability", **viability.to_record()})
+        return BacktestResult(
+            run_id=run_id,
+            report=report,
+            trades=trades,
+            equity_curve=equity_curve,
+            run_dir=run_dir,
+            data_quality=quality,
+            symbol_audit=symbol_audit,
+            strategy_viability=viability,
+        )
 
     def _maybe_close(self, position: Position, row: pd.Series, symbol: SymbolSpec, equity: float) -> Trade | None:
         position.holding_bars += 1
@@ -300,6 +341,10 @@ class BacktestEngine:
             model_version="none",
             config_hash=self.config.config_hash,
             strategy_version=getattr(self.strategy, "version", "unknown"),
+            entry_session=position.metadata.get("session_label"),
+            entry_trend_regime=position.metadata.get("trend_regime"),
+            entry_range_regime=position.metadata.get("range_regime"),
+            entry_spread_percentile_session=position.metadata.get("spread_percentile_session"),
         )
 
     def _slippage(self, row: pd.Series, symbol: SymbolSpec, volume: float) -> float:

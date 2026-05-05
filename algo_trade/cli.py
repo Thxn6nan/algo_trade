@@ -13,6 +13,7 @@ from algo_trade.realtime import RealtimeRunner
 from algo_trade.shadow import ShadowRunner
 from algo_trade.strategies import get_strategy
 from algo_trade.symbols import SymbolRegistry
+from algo_trade.walk_forward import run_walk_forward
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,7 +34,13 @@ def main(argv: list[str] | None = None) -> int:
     symbol = args.symbol or config.enabled_symbols[0]
     strategy = get_strategy(config.raw["signal"].get("strategy", "atr_breakout"))
 
-    if config.mode in {"backtest", "walk_forward", "research"}:
+    if config.mode == "walk_forward":
+        frame = load_backtest_data(config, symbol, args.timeframe)
+        summary = run_walk_forward(config, registry, frame, symbol, strategy)
+        print(json.dumps(summary.to_record(), indent=2, default=str))
+        return 0
+
+    if config.mode in {"backtest", "research"}:
         frame = load_backtest_data(config, symbol, args.timeframe)
         result = BacktestEngine(config, registry, strategy).run(frame, symbol)
         edge_evidence = build_edge_evidence(config, registry, frame, symbol, strategy, result)

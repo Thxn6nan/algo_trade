@@ -12,6 +12,18 @@ import yaml
 
 SUPPORTED_MODES = {"research", "backtest", "walk_forward", "shadow", "paper", "micro_live", "live"}
 LIVE_CAPABLE_MODES = {"micro_live", "live"}
+RULE_BASED_STRATEGIES = {
+    "buy_and_hold",
+    "no_trade",
+    "random_entry",
+    "ma_crossover",
+    "rsi_mean_reversion",
+    "atr_breakout",
+    "session_breakout",
+    "london_ny_volatility_breakout",
+    "pullback_trend_continuation",
+    "range_mean_reversion",
+}
 
 
 @dataclass(frozen=True)
@@ -96,6 +108,11 @@ def validate_config(raw: dict[str, Any]) -> None:
         raise ValueError("Only next_open execution is supported to prevent lookahead")
     if raw["backtest"].get("same_bar_policy") != "conservative":
         raise ValueError("Only conservative same-bar policy is supported initially")
+
+    strategy = raw["signal"].get("strategy", "atr_breakout")
+    rule_based_only = bool(raw.get("strategy_library", {}).get("rule_based_only", True))
+    if rule_based_only and strategy not in RULE_BASED_STRATEGIES:
+        raise ValueError(f"Strategy {strategy!r} is not allowed when strategy_library.rule_based_only=true; model_probability is disabled")
 
 
 def hash_config(raw: dict[str, Any]) -> str:
