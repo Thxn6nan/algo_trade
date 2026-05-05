@@ -21,7 +21,7 @@ data:
   allow_sample_data: false
   require_real_data: true
   auto_fetch_latest: true
-  min_bars: 5000
+  min_bars: 1000
   backfill_bars: 20000
 
 symbols:
@@ -30,19 +30,19 @@ symbols:
     XAUUSDm:
       asset_class: metal
       magic: 7001
-      pip_size: 0.01
-      pip_value: 1.0
-      tick_size: 0.01
-      tick_value: 1.0
+      pip_size: 0.001
+      pip_value: 0.1
+      tick_size: 0.001
+      tick_value: 0.1
       contract_size: 100
       min_lot: 0.01
-      max_lot: 1.0
+      max_lot: 200.0
       lot_step: 0.01
-      average_spread: 160
-      max_spread_points: 280
+      average_spread: 200
+      max_spread_points: 400
       trading_session: "24x5"
       broker_suffix: "m"
-      metadata_confirmed: false
+      metadata_confirmed: true
       metadata_source: config
 
 risk:
@@ -58,7 +58,7 @@ risk:
   emergency_stop_file: EMERGENCY_STOP
 
 signal:
-  strategy: atr_breakout
+  strategy: pullback_trend_continuation
   buy_threshold: 0.60
   sell_threshold: 0.60
   min_rr: 1.5
@@ -94,9 +94,10 @@ edge:
   min_expectancy: 0.0
   max_drawdown: 0.20
   require_beats_baselines: true
-  baselines: [no_trade, random_entry, ma_crossover, atr_breakout, session_breakout]
+  baselines: [no_trade, random_entry, frequency_matched_random, session_matched_random, direction_matched_random, ma_crossover, atr_breakout, session_breakout]
   require_stress_expectancy_positive: true
   stress_slippage_models: [bad, stress]
+  require_walk_forward_positive: true
 
 symbol_audit:
   require_broker_metadata: true
@@ -113,6 +114,7 @@ strategy_viability:
   require_both_sides: false
 
 walk_forward:
+  preset: promotion_default
   train_months: 12
   validation_months: 3
   test_months: 3
@@ -123,6 +125,10 @@ robustness:
   double_worst_n: [1, 3]
   monte_carlo_iterations: 100
   random_seed: 42
+  parameter_sweeps:
+    filters.max_spread_percentile: [0.90, 0.95]
+    signal.min_rr: [1.25, 1.5, 1.75]
+    backtest.time_stop_bars: [12, 24, 36]
 
 reports:
   edge_report: true

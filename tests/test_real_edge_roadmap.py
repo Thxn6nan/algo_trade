@@ -7,14 +7,16 @@ from pathlib import Path
 import pandas as pd
 
 from algo_trade.audit import build_symbol_audit
+from algo_trade.backtest import BacktestResult
 from algo_trade.config import load_config, validate_config
+from algo_trade.edge import _assess
 from algo_trade.edge_report import write_edge_report
 from algo_trade.features import FEATURE_SCHEMA, build_features, validate_feature_schema
 from algo_trade.filters import SignalFilter
 from algo_trade.reports import build_performance_report
-from algo_trade.robustness import run_robustness_suite
+from algo_trade.robustness import run_parameter_sweeps, run_robustness_suite
 from algo_trade.strategies import get_strategy
-from algo_trade.symbols import SymbolSpec
+from algo_trade.symbols import SymbolRegistry, SymbolSpec
 from algo_trade.types import DecisionStatus, Signal, SignalSide, Trade, TradeState
 from algo_trade.viability import build_strategy_viability
 from algo_trade.walk_forward import build_walk_forward_splits
@@ -27,6 +29,8 @@ def symbol() -> SymbolSpec:
         magic=7001,
         pip_size=0.01,
         pip_value=1.0,
+        tick_size=0.01,
+        tick_value=1.0,
         contract_size=100,
         min_lot=0.01,
         max_lot=1.0,
@@ -235,6 +239,53 @@ class RealEdgeRoadmapTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "model_probability"):
             validate_config(raw)
 
+    def test_random_baselines_are_active_enough_to_pass_default_confidence_filters(self):
+        row = build_features(market_frame(80)).data.iloc[-1].copy()
+        row["session_label"] = "London"
+
+        random_strategy = get_strategy("random_entry")
+        random_signals = [random_strategy.generate(row) for _ in range(12)]
+        active_random = [signal for signal in random_signals if signal.side != SignalSide.HOLD]
+        self.assertTrue(active_random)
+        self.assertTrue(all(signal.confidence >= 0.60 for signal in active_random))
+        self.assertNotEqual(get_strategy("frequency_matched_random").generate(row).side, SignalSide.HOLD)
+        self.assertNotEqual(get_strategy("session_matched_random").generate(row).side, SignalSide.HOLD)
+        self.assertNotEqual(get_strategy("direction_matched_random").generate(row).side, SignalSide.HOLD)
+
+    def test_research_dev_walk_forward_split_blocks_promotion_pass(self):
+        class ResearchDevWalkForward:
+            rounds = [{"round": 1}]
+            aggregate = {"positive_rounds": 1, "promotion_eligible": False}
+
+            def to_record(self) -> dict[str, object]:
+                return {"rounds": self.rounds, "aggregate": self.aggregate}
+
+        config = load_config("config/default.yaml")
+        config.raw["data"].update({"require_real_data": False, "min_bars": 1})
+        config.raw["edge"].update(
+            {
+                "min_bars": 1,
+                "min_trades": 1,
+                "require_real_data": False,
+                "require_beats_baselines": False,
+                "require_stress_expectancy_positive": False,
+                "require_walk_forward_positive": True,
+                "require_robustness_positive": False,
+            }
+        )
+        report = build_performance_report(
+            [closed_trade(1.0, 100)],
+            pd.Series([10000, 10100], index=pd.date_range("2026-01-01", periods=2, freq="D")),
+            [],
+            10000,
+        )
+        result = BacktestResult("bt-test", report, [closed_trade(1.0, 100)], pd.Series(dtype=float), Path("."))
+
+        evidence = _assess(config, market_frame(), result, {}, {}, ResearchDevWalkForward(), None)
+
+        self.assertEqual(evidence.verdict, "FAIL")
+        self.assertIn("walk_forward_promotion_eligible", evidence.reasons)
+
     def test_walk_forward_splits_use_locked_test_windows(self):
         frame = pd.DataFrame({"timestamp": pd.date_range("2024-01-01", "2026-01-01", freq="D")})
         splits = build_walk_forward_splits(frame, train_months=12, validation_months=3, test_months=3, step_months=3)
@@ -255,6 +306,22 @@ class RealEdgeRoadmapTest(unittest.TestCase):
         self.assertIn("remove_best_1", summary.trade_dependency)
         self.assertIn("double_worst_1", summary.trade_dependency)
         self.assertEqual(summary.monte_carlo["iterations"], 25)
+
+    def test_parameter_sweeps_are_rerun_based(self):
+        config = load_config("config/default.yaml")
+        config.raw["data"].update({"require_real_data": False, "min_bars": 1})
+        config.raw["robustness"]["parameter_sweeps"] = {
+            "signal.min_rr": [1.4, 1.6],
+            "backtest.time_stop_bars": [12],
+        }
+        registry = SymbolRegistry.from_config(config.raw["symbols"])
+        frame = market_frame(120)
+
+        sweeps = run_parameter_sweeps(config, registry, frame, "XAUUSDm", get_strategy("pullback_trend_continuation"))
+
+        self.assertIn("signal.min_rr=1.4", sweeps)
+        self.assertIn("backtest.time_stop_bars=12", sweeps)
+        self.assertIn("expectancy", sweeps["signal.min_rr=1.4"])
 
     def test_edge_report_writes_machine_and_human_readable_artifacts(self):
         with tempfile.TemporaryDirectory() as temp_dir:

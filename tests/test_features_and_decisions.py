@@ -18,6 +18,8 @@ def symbol() -> SymbolSpec:
         magic=7001,
         pip_size=0.01,
         pip_value=1.0,
+        tick_size=0.01,
+        tick_value=1.0,
         contract_size=100,
         min_lot=0.01,
         max_lot=1.0,

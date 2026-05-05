@@ -380,9 +380,9 @@ class BacktestEngine:
         equity: float,
     ) -> Trade:
         direction = 1 if position.side == SignalSide.BUY else -1
-        value_per_price_unit = (symbol.pip_value / symbol.pip_size) * position.volume
+        value_per_price_unit = (symbol.tick_value / symbol.tick_size) * position.volume
         gross_pnl = direction * (exit_price - position.entry_price) * value_per_price_unit
-        spread_cost = float(row.get("spread", 0.0)) * symbol.pip_size * symbol.pip_value * position.volume * float(self.config.raw["backtest"].get("spread_cost_multiplier", 1.0))
+        spread_cost = float(row.get("spread", 0.0)) * symbol.tick_value * position.volume * float(self.config.raw["backtest"].get("spread_cost_multiplier", 1.0))
         slippage = self._slippage(row, symbol, position.volume)
         commission = float(self.config.raw["backtest"].get("commission_per_lot", 0.0)) * position.volume
         net_pnl = gross_pnl - spread_cost - slippage - commission
@@ -419,7 +419,7 @@ class BacktestEngine:
     def _slippage(self, row: pd.Series, symbol: SymbolSpec, volume: float) -> float:
         model = self.config.raw["backtest"].get("slippage_model", "base")
         multiplier = {"base": 0.5, "bad": 1.0, "stress": 2.0, "news": 3.0}.get(model, 0.5)
-        return float(row.get("spread", 0.0)) * multiplier * symbol.pip_size * symbol.pip_value * volume
+        return float(row.get("spread", 0.0)) * multiplier * symbol.tick_value * volume
 
 
 class NullRecorder:

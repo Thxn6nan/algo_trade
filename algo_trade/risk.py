@@ -54,7 +54,7 @@ class RiskEngine:
             return PositionSizeResult(0.0, 0.0, 0.0, "invalid_stop_distance")
         risk_pct = float(self.config["risk_per_trade"])
         risk_amount = equity * risk_pct
-        value_per_price_unit_per_lot = symbol.pip_value / symbol.pip_size
+        value_per_price_unit_per_lot = symbol.tick_value / symbol.tick_size
         raw_lots = risk_amount / (stop_distance * value_per_price_unit_per_lot)
         lots = symbol.round_lot(raw_lots, max_lot_override=float(self.config.get("max_lot", symbol.max_lot)))
         if lots <= 0:

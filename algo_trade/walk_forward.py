@@ -95,6 +95,7 @@ def run_walk_forward(
     strategy: Strategy,
 ) -> WalkForwardSummary:
     wf_config = config.raw.get("walk_forward", {})
+    split_preset = str(wf_config.get("preset", "promotion_default"))
     splits = build_walk_forward_splits(
         frame,
         train_months=int(wf_config.get("train_months", 12)),
@@ -127,7 +128,7 @@ def run_walk_forward(
         run_dir=run_dir,
         splits=[split.to_record() for split in splits],
         rounds=rounds,
-        aggregate=_aggregate(rounds),
+        aggregate=_aggregate(rounds, split_preset),
     )
     (run_dir / "walk_forward_summary.json").write_text(
         pd.Series(summary.to_record()).to_json(indent=2, default_handler=str),
@@ -142,10 +143,12 @@ def _child_config(config: AppConfig, run_dir: Path) -> AppConfig:
     return AppConfig(raw=raw, path=config.path, config_hash=hash_config(raw))
 
 
-def _aggregate(rounds: list[dict[str, object]]) -> dict[str, object]:
+def _aggregate(rounds: list[dict[str, object]], split_preset: str) -> dict[str, object]:
     returns = [float(round_data["test_metrics"]["total_return"]) for round_data in rounds]  # type: ignore[index]
     expectancies = [float(round_data["test_metrics"]["expectancy"]) for round_data in rounds]  # type: ignore[index]
     return {
+        "split_preset": split_preset,
+        "promotion_eligible": split_preset != "research_dev",
         "rounds": len(rounds),
         "positive_rounds": sum(1 for value in expectancies if value > 0),
         "average_total_return": float(sum(returns) / len(returns)) if returns else 0.0,

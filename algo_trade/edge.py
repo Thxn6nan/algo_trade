@@ -11,7 +11,7 @@ from algo_trade.backtest import BacktestEngine, BacktestResult
 from algo_trade.config import AppConfig, hash_config
 from algo_trade.edge_report import write_edge_report
 from algo_trade.reports import PerformanceReport
-from algo_trade.robustness import run_robustness_suite
+from algo_trade.robustness import run_parameter_sweeps, run_robustness_suite
 from algo_trade.storage import RunRecorder
 from algo_trade.strategies import Strategy, get_strategy
 from algo_trade.symbols import SymbolRegistry
@@ -28,6 +28,8 @@ class EdgeEvidence:
     stress_metrics: dict[str, dict[str, object]]
     strategy_viability: dict[str, object]
     symbol_audit: dict[str, object]
+    walk_forward: dict[str, object] | None = None
+    robustness: dict[str, object] | None = None
 
     def to_record(self) -> dict[str, object]:
         return {
@@ -40,6 +42,8 @@ class EdgeEvidence:
             "stress_metrics": self.stress_metrics,
             "strategy_viability": self.strategy_viability,
             "symbol_audit": self.symbol_audit,
+            "walk_forward": self.walk_forward,
+            "robustness": self.robustness,
         }
 
 
@@ -55,7 +59,7 @@ def build_edge_evidence(
 ) -> EdgeEvidence:
     edge_config = config.raw.get("edge", {})
     if edge_config.get("enabled", True) is False:
-        evidence = _assess(config, frame, primary_result, {}, {})
+        evidence = _assess(config, frame, primary_result, {}, {}, None, None)
         _record_edge(config, primary_result.run_id, primary_result.run_dir, evidence)
         return evidence
 
@@ -89,9 +93,17 @@ def build_edge_evidence(
         ).run(frame.copy(), symbol_name)
         stress_reports[str(slippage_model)] = stress_result.report
 
-    evidence = _assess(config, frame, primary_result, baseline_reports, stress_reports)
+    wf_summary = None
+    if edge_config.get("require_walk_forward_positive", True):
+        from algo_trade.walk_forward import run_walk_forward
+        wf_summary = run_walk_forward(config, registry, frame, symbol_name, strategy)
+
+    parameter_sweeps = run_parameter_sweeps(config, registry, frame, symbol_name, strategy)
+    robustness = run_robustness_suite(primary_result.trades, config.raw.get("robustness", {}), parameter_sweeps)
+
+    evidence = _assess(config, frame, primary_result, baseline_reports, stress_reports, wf_summary, robustness)
     _record_edge(config, primary_result.run_id, primary_result.run_dir, evidence)
-    _record_report(config, primary_result, evidence)
+    _record_report(config, primary_result, evidence, robustness)
     return evidence
 
 
@@ -101,6 +113,8 @@ def _assess(
     primary_result: BacktestResult,
     baseline_reports: dict[str, PerformanceReport],
     stress_reports: dict[str, PerformanceReport],
+    wf_summary: Any | None,
+    robustness: Any | None,
 ) -> EdgeEvidence:
     edge_config = config.raw.get("edge", {})
     primary_report = primary_result.report
@@ -138,6 +152,38 @@ def _assess(
             report.expectancy > min_expectancy for report in stress_reports.values()
         )
 
+    require_walk_forward_positive = bool(edge_config.get("require_walk_forward_positive", True))
+    if require_walk_forward_positive:
+        checks["walk_forward_present"] = bool(wf_summary and wf_summary.rounds)
+        checks["walk_forward_promotion_eligible"] = bool(
+            wf_summary and wf_summary.aggregate.get("promotion_eligible", True)
+        )
+        checks["walk_forward_positive"] = bool(
+            wf_summary
+            and wf_summary.aggregate.get("promotion_eligible", True)
+            and wf_summary.aggregate.get("positive_rounds", 0) > 0
+        )
+
+    require_robustness_positive = bool(edge_config.get("require_robustness_positive", True))
+    if require_robustness_positive:
+        checks["robustness_present"] = bool(robustness)
+        if robustness:
+            dependency_passed = all(
+                result.get("expectancy", 0.0) > min_expectancy
+                for result in robustness.trade_dependency.values()
+            )
+            cost_passed = all(
+                result.get("expectancy", 0.0) > min_expectancy
+                for result in robustness.cost_stress.values()
+            )
+            parameter_passed = bool(robustness.parameter_sweeps) and all(
+                result.get("expectancy", 0.0) > min_expectancy
+                for result in robustness.parameter_sweeps.values()
+            )
+            checks["robustness_positive"] = dependency_passed and cost_passed and parameter_passed
+        else:
+            checks["robustness_positive"] = False
+
     reasons = [name for name, passed in checks.items() if not passed]
     verdict = "PASS" if not reasons else "FAIL"
     failure_class = _failure_class(checks, primary_report, viability_record, symbol_audit_record)
@@ -151,6 +197,8 @@ def _assess(
         stress_metrics={name: report.to_record() for name, report in stress_reports.items()},
         strategy_viability=viability_record,
         symbol_audit=symbol_audit_record,
+        walk_forward=wf_summary.to_record() if wf_summary else None,
+        robustness=robustness.to_record() if robustness else None,
     )
 
 
@@ -186,11 +234,11 @@ def _record_edge(config: AppConfig, run_id: str, run_dir: Path, evidence: EdgeEv
         recorder.close()
 
 
-def _record_report(config: AppConfig, result: BacktestResult, evidence: EdgeEvidence) -> None:
+def _record_report(config: AppConfig, result: BacktestResult, evidence: EdgeEvidence, robustness_summary: Any) -> None:
     if config.raw.get("reports", {}).get("edge_report", True) is False:
         return
     data_quality = result.data_quality.to_record() if result.data_quality and hasattr(result.data_quality, "to_record") else {}
-    robustness = run_robustness_suite(result.trades, config.raw.get("robustness", {})).to_record()
+    robustness = robustness_summary.to_record() if robustness_summary else {}
     promotion_gate = _research_candidate_gate(config, result, evidence)
     write_edge_report(
         result.run_dir,
@@ -207,7 +255,7 @@ def _record_report(config: AppConfig, result: BacktestResult, evidence: EdgeEvid
             "trade_distribution": _trade_distribution(result.trades),
             "r_multiple_distribution": _r_distribution(result.trades),
             "drawdown_curve": _drawdown_curve(result.equity_curve),
-            "walk_forward_summary": {},
+            "walk_forward_summary": evidence.walk_forward or {},
             "robustness_summary": robustness,
             "promotion_gate": promotion_gate,
         },

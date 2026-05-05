@@ -17,7 +17,7 @@ from algo_trade.execution import MT5ExecutionAdapter
 from algo_trade.realtime import RealtimeRunner
 from algo_trade.strategies import Strategy
 from algo_trade.symbols import SymbolRegistry
-from algo_trade.types import OrderRequest, Signal, SignalSide, TradeState
+from algo_trade.types import OrderRequest, Position, Signal, SignalSide, TradeState
 
 
 class AlwaysBuyStrategy(Strategy):
@@ -49,16 +49,16 @@ class FakeGateway:
     def symbol_metadata(self, symbol: str) -> dict[str, object]:
         return {
             "symbol": symbol,
-            "point": 0.01,
-            "digits": 2,
+            "point": 0.001,
+            "digits": 3,
             "spread": 160,
-            "tick_size": 0.01,
-            "tick_value": 1.0,
+            "tick_size": 0.001,
+            "tick_value": 0.1,
             "contract_size": 100,
-            "trade_tick_size": 0.01,
-            "trade_tick_value": 1.0,
+            "trade_tick_size": 0.001,
+            "trade_tick_value": 0.1,
             "volume_min": 0.01,
-            "volume_max": 1.0,
+            "volume_max": 200.0,
             "volume_step": 0.01,
         }
 
@@ -80,6 +80,20 @@ class FakeGateway:
 
     def shutdown(self) -> None:
         self.shutdown_called = True
+
+
+class DummyWalkForwardSummary:
+    rounds = [{"round": 1, "test_metrics": {"expectancy": 1.0}}]
+    aggregate = {"rounds": 1, "positive_rounds": 1}
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "run_id": "wf-test",
+            "run_dir": "runs/wf-test",
+            "splits": [{"locked_test": True}],
+            "rounds": self.rounds,
+            "aggregate": self.aggregate,
+        }
 
 
 def load_sample() -> pd.DataFrame:
@@ -199,6 +213,76 @@ class BacktestAndShadowTest(unittest.TestCase):
 
             self.assertIn("baseline no_trade", {event["label"] for event in progress_events})
 
+    def test_edge_report_includes_walk_forward_and_robustness_evidence(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config("config/default.yaml")
+            config.raw["paths"]["output_dir"] = temp_dir
+            config.raw["data"].update({"allow_sample_data": True, "require_real_data": False, "min_bars": 1})
+            config.raw["edge"].update(
+                {
+                    "min_bars": 1,
+                    "require_real_data": False,
+                    "require_beats_baselines": False,
+                    "require_stress_expectancy_positive": False,
+                    "require_walk_forward_positive": True,
+                    "require_robustness_positive": True,
+                    "baselines": [],
+                    "stress_slippage_models": [],
+                }
+            )
+            registry = SymbolRegistry.from_config(config.raw["symbols"])
+            frame = load_sample()
+            result = BacktestEngine(config, registry, AlwaysBuyStrategy()).run(frame, "XAUUSDm")
+
+            with patch("algo_trade.walk_forward.run_walk_forward", return_value=DummyWalkForwardSummary()):
+                evidence = build_edge_evidence(config, registry, frame, "XAUUSDm", AlwaysBuyStrategy(), result)
+
+            report = json.loads((Path(result.run_dir) / "edge_report.json").read_text(encoding="utf-8"))
+            self.assertEqual(evidence.walk_forward["run_id"], "wf-test")
+            self.assertIn("cost_stress", evidence.robustness)
+            self.assertEqual(report["walk_forward_summary"]["run_id"], "wf-test")
+            self.assertIn("cost_stress", report["edge_evidence"]["robustness"])
+
+    def test_disabled_edge_evidence_still_records_without_walk_forward_or_robustness(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config("config/default.yaml")
+            config.raw["paths"]["output_dir"] = temp_dir
+            config.raw["data"].update({"allow_sample_data": True, "require_real_data": False, "min_bars": 1})
+            config.raw["edge"]["enabled"] = False
+            registry = SymbolRegistry.from_config(config.raw["symbols"])
+            frame = load_sample()
+            result = BacktestEngine(config, registry, AlwaysBuyStrategy()).run(frame, "XAUUSDm")
+
+            evidence = build_edge_evidence(config, registry, frame, "XAUUSDm", AlwaysBuyStrategy(), result)
+
+            self.assertEqual(evidence.verdict, "FAIL")
+            self.assertIsNone(evidence.walk_forward)
+            self.assertIsNone(evidence.robustness)
+
+    def test_backtest_cost_model_uses_tick_value_and_tick_size_units(self):
+        config = load_config("config/default.yaml")
+        registry = SymbolRegistry.from_config(config.raw["symbols"])
+        symbol = registry.get("XAUUSDm")
+        engine = BacktestEngine(config, registry, AlwaysBuyStrategy(), record_events=False)
+        position = Position(
+            trade_id="tr-cost",
+            symbol="XAUUSDm",
+            side=SignalSide.BUY,
+            entry_time=pd.Timestamp("2026-01-01 00:00").to_pydatetime(),
+            entry_price=100.0,
+            volume=0.01,
+            stop_loss=99.0,
+            take_profit=102.0,
+        )
+        row = pd.Series({"timestamp": pd.Timestamp("2026-01-01 00:15"), "spread": 200, "close": 101.0})
+
+        trade = engine._close_position(position, row, 101.0, TradeState.POSITION_CLOSED_TP, symbol, 10000)
+
+        self.assertAlmostEqual(trade.gross_pnl, 1.0)
+        self.assertAlmostEqual(trade.spread_cost, 0.2)
+        self.assertAlmostEqual(trade.slippage, 0.1)
+        self.assertAlmostEqual(trade.net_pnl, 0.7)
+
     def test_same_bar_policy_is_conservative_sl_first(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config = load_config("config/default.yaml")
@@ -279,7 +363,7 @@ class BacktestAndShadowTest(unittest.TestCase):
             )
             frame = load_backtest_data(config, "XAUUSDm", "M15", gateway=FakeGateway())
 
-            self.assertEqual(frame.attrs["broker_metadata"]["trade_tick_value"], 1.0)
+            self.assertEqual(frame.attrs["broker_metadata"]["trade_tick_value"], 0.1)
 
     def test_backtest_persists_broker_symbol_metadata_snapshot(self):
         with tempfile.TemporaryDirectory() as temp_dir:

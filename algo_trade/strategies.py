@@ -35,12 +35,51 @@ class NoTradeStrategy(Strategy):
 class RandomEntryStrategy(Strategy):
     name = "random_entry"
 
-    def __init__(self, seed: int = 42):
+    def __init__(self, seed: int = 42, confidence: float = 0.7):
         self.random = random.Random(seed)
+        self.confidence = confidence
 
     def generate(self, row: pd.Series) -> Signal:
         side = self.random.choice([SignalSide.BUY, SignalSide.SELL, SignalSide.HOLD])
-        return _signal(row, side, self.name, confidence=0.5)
+        return _signal(row, side, self.name, confidence=self.confidence if side != SignalSide.HOLD else 0.0)
+
+
+class FrequencyMatchedRandomStrategy(Strategy):
+    name = "frequency_matched_random"
+
+    def __init__(self, seed: int = 43, trade_probability: float = 0.35):
+        self.random = random.Random(seed)
+        self.trade_probability = trade_probability
+
+    def generate(self, row: pd.Series) -> Signal:
+        if self.random.random() > self.trade_probability:
+            return _signal(row, SignalSide.HOLD, self.name, confidence=0.0)
+        return _signal(row, self.random.choice([SignalSide.BUY, SignalSide.SELL]), self.name, confidence=0.7)
+
+
+class SessionMatchedRandomStrategy(Strategy):
+    name = "session_matched_random"
+
+    def __init__(self, seed: int = 44):
+        self.random = random.Random(seed)
+
+    def generate(self, row: pd.Series) -> Signal:
+        if row.get("session_label") not in {"Asia", "London", "NewYork"}:
+            return _signal(row, SignalSide.HOLD, self.name, confidence=0.0)
+        return _signal(row, self.random.choice([SignalSide.BUY, SignalSide.SELL]), self.name, confidence=0.7)
+
+
+class DirectionMatchedRandomStrategy(Strategy):
+    name = "direction_matched_random"
+
+    def __init__(self, seed: int = 45, side: SignalSide = SignalSide.BUY):
+        self.random = random.Random(seed)
+        self.side = side
+
+    def generate(self, row: pd.Series) -> Signal:
+        if self.random.random() > 0.5:
+            return _signal(row, SignalSide.HOLD, self.name, confidence=0.0)
+        return _signal(row, self.side, self.name, confidence=0.7)
 
 
 class MovingAverageCrossoverStrategy(Strategy):
@@ -187,6 +226,9 @@ def get_strategy(name: str) -> Strategy:
         "buy_and_hold": HoldStrategy(),
         "no_trade": NoTradeStrategy(),
         "random_entry": RandomEntryStrategy(),
+        "frequency_matched_random": FrequencyMatchedRandomStrategy(),
+        "session_matched_random": SessionMatchedRandomStrategy(),
+        "direction_matched_random": DirectionMatchedRandomStrategy(),
         "ma_crossover": MovingAverageCrossoverStrategy(),
         "rsi_mean_reversion": RSIMeanReversionStrategy(),
         "atr_breakout": ATRBreakoutStrategy(),
