@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 
 from algo_trade.data import REQUIRED_COLUMNS
@@ -17,9 +18,14 @@ class DataQualityReport:
     duplicate_timestamps: int
     missing_bars: int
     invalid_candles: int
+    nan_count: int
+    infinite_count: int
     median_spread: float
     p95_spread: float
     timezone: str
+    source: str = "unknown"
+    timestamp_semantics: str = "candle_open_time"
+    validation_status: str = "passed"
 
     def to_record(self) -> dict[str, object]:
         return self.__dict__.copy()
@@ -30,6 +36,8 @@ def validate_ohlcv(
     missing_threshold: int = 0,
     allow_session_gaps: bool = False,
     max_session_gap_minutes: int = 180,
+    source: str = "unknown",
+    timestamp_semantics: str = "candle_open_time",
 ) -> DataQualityReport:
     missing_columns = [column for column in REQUIRED_COLUMNS if column not in frame.columns]
     if missing_columns:
@@ -37,17 +45,24 @@ def validate_ohlcv(
     if frame.empty:
         raise ValueError("OHLCV data is empty")
 
-    timestamps = pd.to_datetime(frame["timestamp"])
-    duplicate_count = int(timestamps.duplicated().sum())
+    timestamps = pd.to_datetime(frame["timestamp"], errors="coerce")
+    if timestamps.isna().any():
+        raise ValueError("Timestamps must be parseable")
+    duplicate_count = int(frame.assign(timestamp=timestamps).duplicated(subset=["symbol", "timeframe", "timestamp"]).sum())
     if duplicate_count:
-        raise ValueError(f"Duplicate timestamps found: {duplicate_count}")
-    if not timestamps.is_monotonic_increasing:
-        raise ValueError("Timestamps must be sorted ascending")
+        raise ValueError(f"Duplicate timestamps per symbol/timeframe found: {duplicate_count}")
+    for (_, _), group in frame.assign(timestamp=timestamps).groupby(["symbol", "timeframe"], sort=False):
+        if not group["timestamp"].is_monotonic_increasing:
+            raise ValueError("Timestamps must be sorted ascending per symbol/timeframe")
 
     numeric_columns = ["open", "high", "low", "close", "volume", "spread"]
     numeric = frame[numeric_columns].apply(pd.to_numeric, errors="coerce")
-    if numeric.isna().any().any():
+    nan_count = int(numeric.isna().sum().sum())
+    infinite_count = int(np.isinf(numeric.to_numpy(dtype=float)).sum()) if not numeric.isna().any().any() else 0
+    if nan_count:
         raise ValueError("OHLCV numeric columns contain NaN or non-numeric values")
+    if infinite_count:
+        raise ValueError("OHLCV numeric columns contain infinite values")
 
     invalid_mask = (
         (numeric["high"] < numeric[["open", "close", "low"]].max(axis=1))
@@ -60,16 +75,19 @@ def validate_ohlcv(
     if invalid_count:
         raise ValueError(f"Invalid candles found: {invalid_count}")
 
-    missing_bars = _count_missing_bars(
-        timestamps,
-        allow_session_gaps=allow_session_gaps,
-        max_session_gap=pd.Timedelta(minutes=max_session_gap_minutes),
-    )
+    missing_bars = 0
+    validated = frame.assign(timestamp=timestamps)
+    for (_, _), group in validated.groupby(["symbol", "timeframe"], sort=False):
+        missing_bars += _count_missing_bars(
+            group["timestamp"].reset_index(drop=True),
+            allow_session_gaps=allow_session_gaps,
+            max_session_gap=pd.Timedelta(minutes=max_session_gap_minutes),
+        )
     if missing_bars > missing_threshold:
         raise ValueError(f"Missing bars {missing_bars} exceeds threshold {missing_threshold}")
 
-    symbol = str(frame["symbol"].iloc[0])
-    timeframe = str(frame["timeframe"].iloc[0])
+    symbol = _summarize_unique(frame["symbol"])
+    timeframe = _summarize_unique(frame["timeframe"])
     timezone = str(getattr(timestamps.dt, "tz", None) or "naive/broker-time")
     return DataQualityReport(
         symbol=symbol,
@@ -80,9 +98,13 @@ def validate_ohlcv(
         duplicate_timestamps=duplicate_count,
         missing_bars=missing_bars,
         invalid_candles=invalid_count,
+        nan_count=nan_count,
+        infinite_count=infinite_count,
         median_spread=float(numeric["spread"].median()),
         p95_spread=float(numeric["spread"].quantile(0.95)),
         timezone=timezone,
+        source=source,
+        timestamp_semantics=timestamp_semantics,
     )
 
 
@@ -99,12 +121,13 @@ def _count_missing_bars(
         return 0
     missing = ((deltas / expected).round().astype(int) - 1).clip(lower=0)
     if allow_session_gaps:
-        gap_mask = deltas > expected
-        for index in deltas[gap_mask].index:
-            previous_timestamp = timestamps.iloc[index - 1]
-            current_timestamp = timestamps.iloc[index]
+        for position, delta in enumerate(deltas, start=1):
+            if delta <= expected:
+                continue
+            previous_timestamp = timestamps.iloc[position - 1]
+            current_timestamp = timestamps.iloc[position]
             if _is_market_session_gap(previous_timestamp, current_timestamp, max_session_gap):
-                missing.loc[index] = 0
+                missing.iloc[position - 1] = 0
     return int(missing.sum())
 
 
@@ -115,3 +138,10 @@ def _is_market_session_gap(previous_timestamp: pd.Timestamp, current_timestamp: 
         return True
     dates = pd.date_range(previous_timestamp.normalize(), current_timestamp.normalize(), freq="D")
     return any(day.weekday() >= 5 for day in dates)
+
+
+def _summarize_unique(values: pd.Series) -> str:
+    unique = [str(value) for value in values.dropna().unique()]
+    if len(unique) <= 3:
+        return ",".join(unique)
+    return f"{len(unique)} values"

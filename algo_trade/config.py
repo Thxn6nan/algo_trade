@@ -10,7 +10,8 @@ from typing import Any
 import yaml
 
 
-SUPPORTED_MODES = {"research", "backtest", "walk_forward", "shadow", "paper", "live"}
+SUPPORTED_MODES = {"research", "backtest", "walk_forward", "shadow", "paper", "micro_live", "live"}
+LIVE_CAPABLE_MODES = {"micro_live", "live"}
 
 
 @dataclass(frozen=True)
@@ -52,7 +53,7 @@ def with_mode(config: AppConfig, mode: str) -> AppConfig:
 
 
 def validate_config(raw: dict[str, Any]) -> None:
-    required_groups = ["mode", "symbols", "risk", "signal", "backtest", "shadow", "execution", "real_data"]
+    required_groups = ["mode", "account", "symbols", "data", "risk", "signal", "backtest", "shadow", "execution", "real_data"]
     missing = [group for group in required_groups if group not in raw]
     if missing:
         raise ValueError(f"Missing config groups: {missing}")
@@ -67,8 +68,8 @@ def validate_config(raw: dict[str, Any]) -> None:
     execution = raw["execution"]
     if mode == "paper" and execution.get("send_orders") is not False:
         raise ValueError("paper mode requires execution.send_orders=false")
-    if mode == "live" and execution.get("send_orders") is not True:
-        raise ValueError("live mode requires execution.send_orders=true")
+    if mode in LIVE_CAPABLE_MODES and execution.get("send_orders") is not True:
+        raise ValueError("live-capable mode requires execution.send_orders=true")
 
     enabled = raw["symbols"].get("enabled") or []
     registry = raw["symbols"].get("registry") or {}
@@ -82,6 +83,14 @@ def validate_config(raw: dict[str, Any]) -> None:
             raise ValueError(f"Missing risk.{key}")
     if not 0 <= float(risk["risk_per_trade"]) <= 0.01:
         raise ValueError("risk.risk_per_trade must be between 0 and 1%")
+    if mode in LIVE_CAPABLE_MODES:
+        if float(risk["risk_per_trade"]) > 0.0025:
+            raise ValueError("live-capable modes require risk.risk_per_trade <= 0.25%")
+        if float(risk["daily_loss_limit"]) > 0.01:
+            raise ValueError("live-capable modes require risk.daily_loss_limit <= 1%")
+        account = raw["account"]
+        if not account.get("expected_account_id") or not account.get("expected_server"):
+            raise ValueError("live-capable modes require account.expected_account_id and account.expected_server")
 
     if raw["backtest"].get("execute_signal_at") != "next_open":
         raise ValueError("Only next_open execution is supported to prevent lookahead")

@@ -1,9 +1,28 @@
 mode:
   name: backtest
 
+account:
+  expected_account_id: null
+  expected_server: null
+  account_currency: USD
+
 paths:
   data_dir: data
   output_dir: runs
+
+data:
+  source: csv
+  timezone: broker
+  timestamp_semantics: candle_open_time
+  missing_bar_policy: warn
+  max_missing_bar_ratio: 0.001
+  allow_session_gaps: true
+  max_session_gap_minutes: 180
+  allow_sample_data: false
+  require_real_data: true
+  auto_fetch_latest: true
+  min_bars: 5000
+  backfill_bars: 20000
 
 symbols:
   enabled: [XAUUSDm]
@@ -22,6 +41,7 @@ symbols:
       broker_suffix: "m"
 
 risk:
+  profile: conservative
   risk_per_trade: 0.0025
   daily_loss_limit: 0.01
   weekly_loss_limit: 0.03
@@ -30,6 +50,7 @@ risk:
   max_symbol_exposure: 1
   max_lot: 0.10
   kill_switch_behavior: HALT_NEW_TRADES
+  emergency_stop_file: EMERGENCY_STOP
 
 signal:
   strategy: atr_breakout
@@ -50,6 +71,19 @@ backtest:
   spread_cost_multiplier: 1.0
   time_stop_bars: 24
 
+edge:
+  enabled: true
+  require_real_data: true
+  min_bars: 5000
+  min_trades: 30
+  min_profit_factor: 1.15
+  min_expectancy: 0.0
+  max_drawdown: 0.20
+  require_beats_baselines: true
+  baselines: [no_trade, random_entry, ma_crossover]
+  require_stress_expectancy_positive: true
+  stress_slippage_models: [bad, stress]
+
 shadow:
   broker: mt5
   send_orders: false
@@ -69,3 +103,4 @@ execution:
   paper_equity: 10000
   live_enabled: false
   confirm_live: ""
+  allow_existing_positions: false

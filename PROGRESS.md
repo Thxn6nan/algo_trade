@@ -4,7 +4,7 @@ Last updated: 2026-05-05
 
 ## Current Status
 
-The project has a runnable Python modular trading core for the first architecture phase: **Backtest + Shadow mode** for **MT5 CFD/FX-style instruments**.
+The project has a runnable Python modular trading core for the first architecture phase: **Backtest + Shadow + Paper + guarded Micro-Live/Live mode** for **MT5 CFD/FX-style instruments**.
 
 Implemented:
 
@@ -12,17 +12,22 @@ Implemented:
 - CLI entrypoint via `run.py`
 - YAML config loading and validation with deterministic `config_hash`
 - Symbol registry for CFD/FX metadata such as pip size, pip value, lot step, max lot, average spread, and magic number
-- Historical CSV market data loader
+- Historical CSV market data loader that prefers real broker data and refuses sample fixtures unless explicitly enabled
+- MT5 backfill path for missing or incomplete historical data, persisted as local real CSV outside git
 - OHLCV validator with fail-fast checks for missing columns, invalid prices, duplicated/unsorted timestamps, negative volume, and negative spread
-- Technical feature pipeline with schema lock
-- Baseline strategies: buy-and-hold, random entry, moving average crossover, RSI mean reversion, and ATR breakout
+- Technical feature pipeline with schema lock and per-symbol/timeframe rolling calculations
+- Baseline strategies: buy-and-hold, no-trade, random entry, moving average crossover, RSI mean reversion, and ATR breakout
+- Model-probability strategy adapter for upstream model outputs
 - Signal filtering for confidence, spread, risk/reward, and volatility availability
 - Risk engine with position sizing, max drawdown guard, daily loss guard, max position checks, and kill-switch snapshot
 - Decision engine that converts raw signals into approved/rejected/held/halted decisions with reason codes
 - Stateful backtest engine with next-open execution, no-lookahead default behavior, TP/SL checks, conservative same-bar TP/SL policy, time stop, and trading costs
-- JSONL logs and SQLite state store per run
+- JSONL logs and SQLite state store per run with common structured log fields
+- Required storage tables for runs, signals, decisions, orders, fills, positions, trades, risk events, reconciliation events, model/config versions, and symbol snapshots
 - Performance report with return, win rate, profit factor, expectancy, drawdown, R multiples, costs, and rejected-signal summary
+- Edge evidence gate with minimum bars/trades, real-data requirement, baseline comparison, and slippage stress checks
 - Shadow runner safety shell where order submission is disabled by construction
+- Paper/live one-cycle runner with MT5 data interface, paper order recording, live confirmation/account/server/env guards, emergency-stop guard, and startup reconciliation halt
 - Unit tests for validation, feature schema, decisions, risk, backtest behavior, same-bar policy, and shadow execution guard
 
 ## Verification
@@ -35,16 +40,19 @@ python run.py --mode backtest --symbol XAUUSDm --timeframe M15
 python run.py --mode shadow --symbol XAUUSDm --timeframe M15
 ```
 
-The test suite currently passes with 13 tests.
+The test suite currently passes with 27 tests.
 
 ## Important Safety State
 
-- `research`, `backtest`, `walk_forward`, and `shadow` are the only supported modes.
-- `paper` and `live` are intentionally unavailable.
+- Supported modes are `research`, `backtest`, `walk_forward`, `shadow`, `paper`, `micro_live`, and `live`.
 - `shadow.send_orders` must remain `false`.
-- `MT5ExecutionAdapter.submit_order()` raises unless order sending is explicitly enabled, and live submission is still not implemented.
+- `MT5ExecutionAdapter.submit_order()` raises unless order sending is explicitly enabled.
+- `paper` must keep `execution.send_orders=false`.
+- `micro_live` and `live` require explicit order sending config, live confirmation phrase, matching `.env` account/server values, non-research risk profile, and no emergency stop file.
 - Backtest execution is fixed to `next_open` to prevent lookahead mistakes.
 - Same-bar TP/SL policy is fixed to `conservative`.
+- Default backtest requires real data, at least 5,000 bars, and attempts MT5 backfill up to 20,000 bars when local data is missing or incomplete.
+- A backtest can finish with `edge_evidence.verdict = FAIL`; that is the intended result when the evidence does not support an edge.
 
 ## Generated Artifacts
 
@@ -55,7 +63,10 @@ Each run may include:
 - `signals.jsonl`
 - `decisions.jsonl`
 - `orders.jsonl`
+- `fills.jsonl`
+- `positions.jsonl`
 - `trades.jsonl`
+- `reconciliation.jsonl`
 - `system_events.jsonl`
 - `state.sqlite`
 
@@ -66,8 +77,9 @@ These are useful for inspection, but future cleanup may choose to ignore or arch
 1. Add real historical data ingestion paths beyond the sample CSV.
 2. Add walk-forward orchestration rather than treating it as a backtest alias.
 3. Add richer data quality reporting for missing sessions and broker timezone metadata.
-4. Add baseline comparison runner across all baseline strategies.
-5. Add robustness tests: cost stress, slippage stress, parameter sensitivity, Monte Carlo trade shuffle.
-6. Add a real MT5 market-data adapter for shadow mode, still with order submission disabled.
-7. Add documentation for risk settings, symbol registry fields, and backtest assumptions.
-8. Add packaging/dev workflow decisions such as dependency lockfile and CI.
+4. Add robustness tests: parameter sensitivity, Monte Carlo trade shuffle, remove-best-trades, and regime/session analysis.
+5. Add strategy research work that can actually pass the edge evidence gate on out-of-sample data.
+6. Add shadow-mode live signal generation over MT5 data, still with order submission disabled.
+7. Add richer reconciliation against persisted local positions and broker magic numbers.
+8. Add documentation for risk settings, symbol registry fields, and backtest assumptions.
+9. Add packaging/dev workflow decisions such as dependency lockfile and CI.

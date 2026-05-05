@@ -1,0 +1,125 @@
+//@version=6
+indicator("Algo Trade Core Mirror - Evidence Indicator", overlay = true, max_labels_count = 500, max_lines_count = 500)
+
+// This indicator mirrors the current Python signal/filter logic for visual research.
+// It is not the live engine: MT5 execution, reconciliation, position sizing,
+// SQLite/JSONL logs, data backfill, and edge evidence gates remain in Python.
+
+strategyInput = input.string("ATR Breakout", "Signal model", options = ["ATR Breakout", "MA Crossover", "RSI Mean Reversion", "No Trade"])
+atrLen = input.int(14, "ATR length", minval = 2)
+breakoutLen = input.int(5, "Breakout lookback", minval = 2)
+emaFastLen = input.int(5, "EMA fast", minval = 1)
+emaSlowLen = input.int(10, "EMA slow", minval = 2)
+rsiLen = input.int(14, "RSI length", minval = 2)
+
+buyThreshold = input.float(0.60, "Buy confidence threshold", minval = 0.0, maxval = 1.0, step = 0.01)
+sellThreshold = input.float(0.60, "Sell confidence threshold", minval = 0.0, maxval = 1.0, step = 0.01)
+minRR = input.float(1.50, "Minimum R:R", minval = 0.1, step = 0.1)
+minAtr = input.float(0.0, "Minimum ATR", minval = 0.0, step = 0.01)
+
+spreadPoints = input.float(18.0, "Current/assumed spread points", minval = 0.0, step = 0.1)
+averageSpreadPoints = input.float(18.0, "Average spread points", minval = 0.0, step = 0.1)
+maxSpreadMultiplier = input.float(2.5, "Max spread multiplier", minval = 0.1, step = 0.1)
+
+stopAtrMult = input.float(2.0, "Stop ATR multiple", minval = 0.1, step = 0.1)
+takeAtrMult = input.float(4.0, "Take profit ATR multiple", minval = 0.1, step = 0.1)
+showExecutionBar = input.bool(true, "Show next-bar execution markers")
+showLevels = input.bool(true, "Show next-open SL/TP levels")
+
+tr = math.max(high - low, math.max(math.abs(high - nz(close[1], close)), math.abs(low - nz(close[1], close))))
+atr = ta.sma(tr, atrLen)
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+
+delta = ta.change(close)
+gain = math.max(delta, 0.0)
+loss = math.max(-delta, 0.0)
+avgGain = ta.sma(gain, rsiLen)
+avgLoss = ta.sma(loss, rsiLen)
+rs = avgLoss == 0.0 ? na : avgGain / avgLoss
+rsi = 100.0 - (100.0 / (1.0 + rs))
+
+rollingHigh = ta.highest(high, breakoutLen)[1]
+rollingLow = ta.lowest(low, breakoutLen)[1]
+
+int rawSide = 0
+float confidence = 0.0
+
+if strategyInput == "ATR Breakout"
+    if not na(rollingHigh) and close > rollingHigh
+        rawSide := 1
+        confidence := 0.72
+    else if not na(rollingLow) and close < rollingLow
+        rawSide := -1
+        confidence := 0.72
+else if strategyInput == "MA Crossover"
+    if emaFast > emaSlow
+        rawSide := 1
+        confidence := 0.70
+    else if emaFast < emaSlow
+        rawSide := -1
+        confidence := 0.70
+else if strategyInput == "RSI Mean Reversion"
+    if not na(rsi) and rsi < 30.0
+        rawSide := 1
+        confidence := 0.65
+    else if not na(rsi) and rsi > 70.0
+        rawSide := -1
+        confidence := 0.65
+
+rr = takeAtrMult / stopAtrMult
+spreadOk = spreadPoints <= averageSpreadPoints * maxSpreadMultiplier
+rrOk = rr >= minRR
+atrOk = not na(atr) and atr > minAtr
+confidenceOk = rawSide == 1 ? confidence >= buyThreshold : rawSide == -1 ? confidence >= sellThreshold : false
+approvedSignal = rawSide != 0 and confidenceOk and spreadOk and rrOk and atrOk
+
+longSignal = barstate.isconfirmed and approvedSignal and rawSide == 1
+shortSignal = barstate.isconfirmed and approvedSignal and rawSide == -1
+rejectedSignal = barstate.isconfirmed and rawSide != 0 and not approvedSignal
+
+execLong = showExecutionBar and longSignal[1]
+execShort = showExecutionBar and shortSignal[1]
+execAtr = atr[1]
+
+longStop = execLong ? open - stopAtrMult * execAtr : na
+longTake = execLong ? open + takeAtrMult * execAtr : na
+shortStop = execShort ? open + stopAtrMult * execAtr : na
+shortTake = execShort ? open - takeAtrMult * execAtr : na
+
+plot(emaFast, "EMA fast", color = color.new(color.teal, 0))
+plot(emaSlow, "EMA slow", color = color.new(color.orange, 0))
+plot(rollingHigh, "Rolling high (prior)", color = color.new(color.green, 70), style = plot.style_linebr)
+plot(rollingLow, "Rolling low (prior)", color = color.new(color.red, 70), style = plot.style_linebr)
+
+plotshape(longSignal, "Approved buy signal at close", shape.triangleup, location.belowbar, color.new(color.lime, 0), size = size.tiny, text = "BUY")
+plotshape(shortSignal, "Approved sell signal at close", shape.triangledown, location.abovebar, color.new(color.red, 0), size = size.tiny, text = "SELL")
+plotshape(rejectedSignal, "Rejected raw signal", shape.xcross, location.top, color.new(color.gray, 0), size = size.tiny, text = "REJ")
+plotshape(execLong, "Earliest long execution bar", shape.circle, location.belowbar, color.new(color.green, 0), size = size.tiny, text = "NX")
+plotshape(execShort, "Earliest short execution bar", shape.circle, location.abovebar, color.new(color.maroon, 0), size = size.tiny, text = "NX")
+
+plot(showLevels ? longStop : na, "Long SL", color = color.new(color.red, 0), style = plot.style_linebr)
+plot(showLevels ? longTake : na, "Long TP", color = color.new(color.green, 0), style = plot.style_linebr)
+plot(showLevels ? shortStop : na, "Short SL", color = color.new(color.red, 0), style = plot.style_linebr)
+plot(showLevels ? shortTake : na, "Short TP", color = color.new(color.green, 0), style = plot.style_linebr)
+
+var table status = table.new(position.top_right, 2, 7, bgcolor = color.new(color.black, 80))
+if barstate.islast
+    table.cell(status, 0, 0, "Mode", text_color = color.white)
+    table.cell(status, 1, 0, strategyInput, text_color = color.white)
+    table.cell(status, 0, 1, "Spread OK", text_color = color.white)
+    table.cell(status, 1, 1, str.tostring(spreadOk), text_color = spreadOk ? color.lime : color.red)
+    table.cell(status, 0, 2, "ATR OK", text_color = color.white)
+    table.cell(status, 1, 2, str.tostring(atrOk), text_color = atrOk ? color.lime : color.red)
+    table.cell(status, 0, 3, "R:R", text_color = color.white)
+    table.cell(status, 1, 3, str.tostring(rr, "#.##"), text_color = rrOk ? color.lime : color.red)
+    table.cell(status, 0, 4, "Confidence", text_color = color.white)
+    table.cell(status, 1, 4, str.tostring(confidence, "#.##"), text_color = confidenceOk ? color.lime : color.red)
+    table.cell(status, 0, 5, "Raw side", text_color = color.white)
+    table.cell(status, 1, 5, rawSide == 1 ? "BUY" : rawSide == -1 ? "SELL" : "HOLD", text_color = rawSide == 1 ? color.lime : rawSide == -1 ? color.red : color.gray)
+    table.cell(status, 0, 6, "Decision", text_color = color.white)
+    table.cell(status, 1, 6, approvedSignal ? "APPROVED" : rawSide == 0 ? "HOLD" : "REJECTED", text_color = approvedSignal ? color.lime : rawSide == 0 ? color.gray : color.red)
+
+alertcondition(longSignal, "Algo Trade approved BUY signal", "Algo Trade Core mirror approved BUY at candle close. Earliest execution is next bar open.")
+alertcondition(shortSignal, "Algo Trade approved SELL signal", "Algo Trade Core mirror approved SELL at candle close. Earliest execution is next bar open.")
+alertcondition(rejectedSignal, "Algo Trade rejected raw signal", "Algo Trade Core mirror rejected a raw signal because one or more filters failed.")

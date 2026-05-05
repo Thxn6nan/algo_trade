@@ -6,6 +6,7 @@ from algo_trade.decisions import DecisionEngine
 from algo_trade.features import FeatureFrame, FEATURE_SCHEMA, build_features, validate_feature_schema
 from algo_trade.filters import SignalFilter
 from algo_trade.risk import RiskEngine
+from algo_trade.strategies import get_strategy
 from algo_trade.symbols import SymbolSpec
 from algo_trade.types import DecisionStatus, Signal, SignalSide
 
@@ -39,6 +40,50 @@ class FeatureAndDecisionTest(unittest.TestCase):
         feature_frame = build_features(frame)
         self.assertEqual(feature_frame.schema, FEATURE_SCHEMA)
         validate_feature_schema(feature_frame)
+
+    def test_feature_pipeline_rolls_per_symbol(self):
+        first = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-01-01", periods=4, freq="15min"),
+                "symbol": ["AAA"] * 4,
+                "timeframe": ["M15"] * 4,
+                "open": [10, 11, 12, 13],
+                "high": [11, 12, 13, 14],
+                "low": [9, 10, 11, 12],
+                "close": [10, 11, 12, 13],
+                "volume": [100] * 4,
+                "spread": [1] * 4,
+            }
+        )
+        second = first.copy()
+        second["symbol"] = "BBB"
+        second[["open", "high", "low", "close"]] += 100
+        features = build_features(pd.concat([first, second], ignore_index=True)).data
+        first_bbb = features[features["symbol"] == "BBB"].iloc[0]
+        self.assertTrue(pd.isna(first_bbb["return"]))
+        self.assertTrue(pd.isna(first_bbb["rolling_high"]))
+
+    def test_model_probability_strategy_uses_probability_columns(self):
+        row = pd.Series(
+            {
+                "timestamp": pd.Timestamp("2026-01-01"),
+                "symbol": "XAUUSDm",
+                "timeframe": "M15",
+                "open": 100,
+                "high": 101,
+                "low": 99,
+                "close": 100,
+                "model_buy_prob": 0.72,
+                "model_sell_prob": 0.12,
+            }
+        )
+        signal = get_strategy("model_probability").generate(row)
+        self.assertEqual(signal.side, SignalSide.BUY)
+        self.assertEqual(signal.source, "model_probability")
+
+    def test_no_trade_baseline_holds(self):
+        row = pd.Series({"timestamp": pd.Timestamp("2026-01-01"), "symbol": "XAUUSDm", "timeframe": "M15", "close": 100})
+        self.assertEqual(get_strategy("no_trade").generate(row).side, SignalSide.HOLD)
 
     def test_approved_signal_requires_risk_layer(self):
         signal = Signal(

@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
+import uuid
 
 
 class SignalSide(StrEnum):
@@ -34,17 +35,23 @@ class DecisionStatus(StrEnum):
 class TradeState(StrEnum):
     SIGNAL_CREATED = "SIGNAL_CREATED"
     SIGNAL_REJECTED = "SIGNAL_REJECTED"
+    DECISION_APPROVED = "DECISION_APPROVED"
+    DECISION_REJECTED = "DECISION_REJECTED"
     ORDER_CREATED = "ORDER_CREATED"
     ORDER_SENT = "ORDER_SENT"
     ORDER_FILLED = "ORDER_FILLED"
+    ORDER_PARTIALLY_FILLED = "ORDER_PARTIALLY_FILLED"
     ORDER_REJECTED = "ORDER_REJECTED"
     POSITION_OPEN = "POSITION_OPEN"
+    POSITION_MODIFIED = "POSITION_MODIFIED"
     POSITION_PARTIALLY_CLOSED = "POSITION_PARTIALLY_CLOSED"
     POSITION_CLOSED_TP = "POSITION_CLOSED_TP"
     POSITION_CLOSED_SL = "POSITION_CLOSED_SL"
     POSITION_CLOSED_TIMEOUT = "POSITION_CLOSED_TIMEOUT"
     POSITION_CLOSED_SIGNAL = "POSITION_CLOSED_SIGNAL"
+    POSITION_CLOSED_RISK = "POSITION_CLOSED_RISK"
     POSITION_CLOSED_MANUAL = "POSITION_CLOSED_MANUAL"
+    POSITION_CLOSED_UNKNOWN = "POSITION_CLOSED_UNKNOWN"
     ERROR = "ERROR"
 
 
@@ -77,12 +84,14 @@ class Signal:
     expected_return: float
     source: str
     timeframe: str
+    signal_id: str = field(default_factory=lambda: f"sig-{uuid.uuid4().hex[:12]}")
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_record(self) -> dict[str, Any]:
         record = asdict(self)
         record["timestamp"] = self.timestamp.isoformat()
         record["side"] = self.side.value
+        record["strategy_name"] = self.source
         return record
 
 
@@ -101,6 +110,8 @@ class TradeDecision:
     rr: float
     status: DecisionStatus
     reasons: list[str]
+    signal_id: str | None = None
+    decision_id: str = field(default_factory=lambda: f"dec-{uuid.uuid4().hex[:12]}")
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_record(self) -> dict[str, Any]:
@@ -109,6 +120,20 @@ class TradeDecision:
         record["decision"] = self.decision.value
         record["side"] = self.side.value
         record["status"] = self.status.value
+        record["raw_signal"] = self.side.value
+        record["final_decision"] = self.decision.value
+        record["confidence"] = self.metadata.get("confidence")
+        record["expected_return"] = self.metadata.get("expected_return")
+        record["spread_points"] = self.metadata.get("spread")
+        record["ATR"] = self.metadata.get("atr")
+        record["risk_reward"] = self.rr
+        record["position_size_lots"] = self.position_size
+        record["risk_amount"] = self.metadata.get("risk_amount", 0.0)
+        record["filters_passed"] = self.metadata.get("filters_passed", [])
+        record["filters_failed"] = self.metadata.get("filters_failed", [])
+        record["reason_codes"] = self.reasons
+        record["strategy_name"] = self.metadata.get("source")
+        record["feature_schema_version"] = self.metadata.get("feature_schema_version")
         return record
 
 
@@ -160,6 +185,8 @@ class Trade:
     holding_bars: int
     model_version: str
     config_hash: str
+    strategy_version: str = "0.1.0"
+    swap: float = 0.0
 
     def to_record(self) -> dict[str, Any]:
         record = asdict(self)
@@ -167,6 +194,9 @@ class Trade:
         record["entry_time"] = self.entry_time.isoformat()
         record["exit_time"] = self.exit_time.isoformat()
         record["exit_reason"] = self.exit_reason.value
+        record["position_size_lots"] = self.position_size
+        record["R_multiple"] = self.r_multiple
+        record["holding_time"] = self.holding_bars
         return record
 
 

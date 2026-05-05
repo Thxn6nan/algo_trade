@@ -15,7 +15,7 @@ from algo_trade.risk import RiskEngine
 from algo_trade.storage import RunRecorder
 from algo_trade.strategies import Strategy
 from algo_trade.symbols import SymbolRegistry, SymbolSpec
-from algo_trade.types import DecisionStatus, Position, RunMetadata, SignalSide, Trade, TradeState
+from algo_trade.types import DecisionStatus, DecisionType, Position, RunMetadata, Signal, SignalSide, Trade, TradeDecision, TradeState
 from algo_trade.validation import validate_ohlcv
 
 
@@ -29,20 +29,44 @@ class BacktestResult:
 
 
 class BacktestEngine:
-    def __init__(self, config: AppConfig, registry: SymbolRegistry, strategy: Strategy):
+    def __init__(self, config: AppConfig, registry: SymbolRegistry, strategy: Strategy, record_events: bool = True):
         self.config = config
         self.registry = registry
         self.strategy = strategy
+        self.record_events = record_events
 
     def run(self, frame: pd.DataFrame, symbol_name: str) -> BacktestResult:
-        quality = validate_ohlcv(frame)
+        self._enforce_data_evidence(frame, symbol_name)
+        data_config = self.config.raw.get("data", {})
+        missing_bar_policy = str(data_config.get("missing_bar_policy", "fail"))
+        missing_threshold = int(
+            data_config.get(
+                "missing_bars_allowed",
+                len(frame) * float(data_config.get("max_missing_bar_ratio", 0.0)),
+            )
+        )
+        if missing_bar_policy == "warn":
+            missing_threshold = len(frame)
+        quality = validate_ohlcv(
+            frame,
+            missing_threshold=missing_threshold,
+            allow_session_gaps=bool(data_config.get("allow_session_gaps", False)),
+            max_session_gap_minutes=int(data_config.get("max_session_gap_minutes", 180)),
+            source=str(self.config.raw.get("data", {}).get("source", "csv")),
+            timestamp_semantics=str(self.config.raw.get("data", {}).get("timestamp_semantics", "candle_open_time")),
+        )
         feature_frame = build_features(frame)
         validate_feature_schema(feature_frame)
         data = feature_frame.data
+        data["feature_schema_version"] = feature_frame.feature_schema_version
         symbol = self.registry.get(symbol_name)
         run_id = f"bt-{uuid.uuid4().hex[:12]}"
         run_dir = self.config.output_dir / run_id
-        recorder = RunRecorder(run_id, run_dir)
+        recorder = (
+            RunRecorder(run_id, run_dir, mode=self.config.mode, config_hash=self.config.config_hash)
+            if self.record_events
+            else NullRecorder()
+        )
         try:
             metadata = RunMetadata(
                 run_id=run_id,
@@ -54,6 +78,7 @@ class BacktestEngine:
             recorder.record("system_events", "runs", metadata.to_record())
             recorder.record("system_events", "system_events", {"event": "data_quality", **quality.to_record()})
             recorder.record("system_events", "config_versions", {"config_hash": self.config.config_hash, "config": self.config.raw})
+            recorder.record("system_events", "symbol_registry_snapshots", {"symbols": self.config.raw["symbols"]})
 
             risk = RiskEngine(self.config.raw["risk"], float(self.config.raw["backtest"]["initial_equity"]))
             filters = SignalFilter(self.config.raw["signal"], self.config.raw.get("filters", {}))
@@ -61,6 +86,17 @@ class BacktestEngine:
             return self._simulate(data, symbol, risk, decisions, recorder, run_id, run_dir)
         finally:
             recorder.close()
+
+    def _enforce_data_evidence(self, frame: pd.DataFrame, symbol_name: str) -> None:
+        data_config = self.config.raw.get("data", {})
+        min_bars = int(data_config.get("min_bars", 0))
+        if len(frame) < min_bars:
+            raise ValueError(
+                f"Backtest evidence rejected for {symbol_name}: {len(frame)} bars found, "
+                f"minimum required is {min_bars}. Use real broker data or enable MT5 backfill."
+            )
+        if bool(data_config.get("require_real_data", True)) and bool(frame.attrs.get("is_sample_data", False)):
+            raise ValueError("Backtest evidence rejected: sample fixture data is not allowed when data.require_real_data=true")
 
     def _simulate(
         self,
@@ -93,6 +129,9 @@ class BacktestEngine:
             signal = self.strategy.generate(row)
             recorder.record("signals", "signals", signal.to_record(), signal.timestamp.isoformat())
             if position is not None:
+                decision = self._blocked_by_position_decision(signal, position)
+                recorder.record("decisions", "decisions", decision.to_record(), decision.timestamp.isoformat())
+                rejected_reasons.extend(decision.reasons)
                 equity_points.append((timestamp, equity))
                 continue
 
@@ -124,6 +163,34 @@ class BacktestEngine:
                         "entry_price": position.entry_price,
                         "stop_loss": position.stop_loss,
                         "take_profit": position.take_profit,
+                    },
+                    position.entry_time.isoformat(),
+                )
+                recorder.record(
+                    "fills",
+                    "fills",
+                    {
+                        "trade_id": position.trade_id,
+                        "symbol": position.symbol,
+                        "side": position.side.value,
+                        "fill_price": position.entry_price,
+                        "volume": position.volume,
+                        "state": TradeState.ORDER_FILLED.value,
+                    },
+                    position.entry_time.isoformat(),
+                )
+                recorder.record(
+                    "positions",
+                    "positions",
+                    {
+                        "trade_id": position.trade_id,
+                        "symbol": position.symbol,
+                        "side": position.side.value,
+                        "entry_price": position.entry_price,
+                        "volume": position.volume,
+                        "stop_loss": position.stop_loss,
+                        "take_profit": position.take_profit,
+                        "state": position.state.value,
                     },
                     position.entry_time.isoformat(),
                 )
@@ -168,6 +235,31 @@ class BacktestEngine:
             return self._close_position(position, row, float(row["close"]), TradeState.POSITION_CLOSED_TIMEOUT, symbol, equity)
         return None
 
+    def _blocked_by_position_decision(self, signal: Signal, position: Position) -> TradeDecision:
+        return TradeDecision(
+            timestamp=signal.timestamp,
+            symbol=signal.symbol,
+            decision=DecisionType.REJECT,
+            side=signal.side,
+            entry_type=None,
+            entry_price_estimate=None,
+            stop_loss=None,
+            take_profit=None,
+            risk_pct=0.0,
+            position_size=0.0,
+            rr=0.0,
+            status=DecisionStatus.REJECTED,
+            reasons=["position_already_open"],
+            signal_id=signal.signal_id,
+            metadata={
+                "source": signal.source,
+                "confidence": signal.confidence,
+                "expected_return": signal.expected_return,
+                "open_trade_id": position.trade_id,
+                **signal.metadata,
+            },
+        )
+
     def _close_position(
         self,
         position: Position,
@@ -207,9 +299,18 @@ class BacktestEngine:
             holding_bars=position.holding_bars,
             model_version="none",
             config_hash=self.config.config_hash,
+            strategy_version=getattr(self.strategy, "version", "unknown"),
         )
 
     def _slippage(self, row: pd.Series, symbol: SymbolSpec, volume: float) -> float:
         model = self.config.raw["backtest"].get("slippage_model", "base")
         multiplier = {"base": 0.5, "bad": 1.0, "stress": 2.0, "news": 3.0}.get(model, 0.5)
         return float(row.get("spread", 0.0)) * multiplier * symbol.pip_size * symbol.pip_value * volume
+
+
+class NullRecorder:
+    def record(self, stream: str, table: str, payload: dict, timestamp: str | None = None) -> None:
+        return None
+
+    def close(self) -> None:
+        return None

@@ -38,15 +38,54 @@ class DecisionEngine:
         rr = abs(take_profit - entry_price) / abs(entry_price - stop_loss)
         filter_result = self.filters.evaluate(signal, symbol, rr)
         if not filter_result.passed:
-            return _decision(signal, DecisionType.REJECT, DecisionStatus.REJECTED, entry_price, stop_loss, take_profit, 0.0, rr, filter_result.failed_reasons)
+            return _decision(
+                signal,
+                DecisionType.REJECT,
+                DecisionStatus.REJECTED,
+                entry_price,
+                stop_loss,
+                take_profit,
+                0.0,
+                rr,
+                filter_result.failed_reasons,
+                filters_passed=filter_result.passed_reasons,
+                filters_failed=filter_result.failed_reasons,
+            )
 
         size = self.risk.size_position(equity, symbol, entry_price, stop_loss)
         if size.lots <= 0:
-            return _decision(signal, DecisionType.REJECT, DecisionStatus.REJECTED, entry_price, stop_loss, take_profit, 0.0, rr, [size.reason])
+            return _decision(
+                signal,
+                DecisionType.REJECT,
+                DecisionStatus.REJECTED,
+                entry_price,
+                stop_loss,
+                take_profit,
+                0.0,
+                rr,
+                [size.reason],
+                filters_passed=filter_result.passed_reasons,
+                filters_failed=filter_result.failed_reasons,
+                risk_amount=size.risk_amount,
+            )
 
         decision_type = DecisionType.ENTER_LONG if signal.side == SignalSide.BUY else DecisionType.ENTER_SHORT
         reasons = filter_result.passed_reasons + [size.reason, "stop_loss_required"]
-        return _decision(signal, decision_type, DecisionStatus.APPROVED, entry_price, stop_loss, take_profit, size.risk_pct, rr, reasons, size.lots)
+        return _decision(
+            signal,
+            decision_type,
+            DecisionStatus.APPROVED,
+            entry_price,
+            stop_loss,
+            take_profit,
+            size.risk_pct,
+            rr,
+            reasons,
+            size.lots,
+            filters_passed=filter_result.passed_reasons,
+            filters_failed=filter_result.failed_reasons,
+            risk_amount=size.risk_amount,
+        )
 
 
 def _stops(side: SignalSide, entry_price: float, atr: float) -> tuple[float, float]:
@@ -68,6 +107,9 @@ def _decision(
     rr: float,
     reasons: list[str],
     position_size: float = 0.0,
+    filters_passed: list[str] | None = None,
+    filters_failed: list[str] | None = None,
+    risk_amount: float = 0.0,
 ) -> TradeDecision:
     return TradeDecision(
         timestamp=signal.timestamp,
@@ -83,5 +125,14 @@ def _decision(
         rr=rr,
         status=status,
         reasons=reasons,
-        metadata={"source": signal.source, "confidence": signal.confidence, **signal.metadata},
+        signal_id=signal.signal_id,
+        metadata={
+            "source": signal.source,
+            "confidence": signal.confidence,
+            "expected_return": signal.expected_return,
+            "filters_passed": filters_passed or [],
+            "filters_failed": filters_failed or [],
+            "risk_amount": risk_amount,
+            **signal.metadata,
+        },
     )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 from algo_trade.config import AppConfig
@@ -46,18 +47,35 @@ class RealtimeRunner:
 
     def run_once(self, symbol_name: str, timeframe: str) -> RealtimeRunResult:
         mode = self.config.mode
-        if mode not in {"paper", "live"}:
-            raise ValueError(f"RealtimeRunner only supports paper/live, got {mode!r}")
-        if mode == "live":
+        if mode not in {"paper", "micro_live", "live"}:
+            raise ValueError(f"RealtimeRunner only supports paper/micro_live/live, got {mode!r}")
+        if mode in {"micro_live", "live"}:
             self._validate_live_guards()
 
         symbol = self.registry.get(symbol_name)
         run_id = f"{mode}-{uuid.uuid4().hex[:12]}"
         run_dir = self.config.output_dir / run_id
-        recorder = RunRecorder(run_id, run_dir)
+        recorder = RunRecorder(run_id, run_dir, mode=mode, config_hash=self.config.config_hash)
         order_action = "none"
         decision_status = "UNKNOWN"
         try:
+            open_positions = self.gateway.open_positions_count(symbol_name)
+            reconciliation = self._reconcile_startup(symbol_name, open_positions)
+            recorder.record("reconciliation", "reconciliation_events", reconciliation)
+            if reconciliation["status"] != "passed":
+                return RealtimeRunResult(run_id, mode, "HALTED", "reconciliation_halt", str(run_dir))
+
+            if not self.gateway.is_market_open(
+                symbol_name,
+                int(self.config.raw.get("real_data", {}).get("max_tick_age_seconds", 1800)),
+            ):
+                recorder.record(
+                    "risk_events",
+                    "risk_events",
+                    {"event": "market_closed_or_stale", "symbol": symbol_name, "severity": "CRITICAL"},
+                )
+                return RealtimeRunResult(run_id, mode, "HALTED", "market_closed_or_stale", str(run_dir))
+
             bars_count = int(self.config.raw.get("real_data", {}).get("bars", 250))
             frame = self.gateway.latest_bars(symbol_name, timeframe, count=bars_count, include_current=False)
             quality = validate_ohlcv(
@@ -65,15 +83,17 @@ class RealtimeRunner:
                 missing_threshold=int(self.config.raw.get("real_data", {}).get("missing_bars_allowed", 0)),
                 allow_session_gaps=bool(self.config.raw.get("real_data", {}).get("allow_session_gaps", True)),
                 max_session_gap_minutes=int(self.config.raw.get("real_data", {}).get("max_session_gap_minutes", 180)),
+                source=str(self.config.raw.get("real_data", {}).get("source", "mt5")),
+                timestamp_semantics=str(self.config.raw.get("data", {}).get("timestamp_semantics", "candle_open_time")),
             )
             feature_frame = build_features(frame)
             validate_feature_schema(feature_frame)
             data = feature_frame.data
+            data["feature_schema_version"] = feature_frame.feature_schema_version
             row = data.iloc[-1]
             signal = self.strategy.generate(row)
             entry_price = self.gateway.current_price(symbol_name, signal.side) if signal.side != SignalSide.HOLD else float(row["close"])
             equity = self._equity()
-            open_positions = self.gateway.open_positions_count(symbol_name)
 
             metadata = RunMetadata(
                 run_id=run_id,
@@ -119,12 +139,46 @@ class RealtimeRunner:
     def _validate_live_guards(self) -> None:
         load_dotenv(self.config.raw.get("execution", {}).get("env_path", ".env"))
         execution = self.config.raw.get("execution", {})
+        account = self.config.raw.get("account", {})
+        risk = self.config.raw.get("risk", {})
         if execution.get("live_enabled") is not True:
             raise RuntimeError("live mode requires execution.live_enabled=true")
         if execution.get("confirm_live") != "I_UNDERSTAND_LIVE_TRADING_RISK":
             raise RuntimeError("live mode requires execution.confirm_live=I_UNDERSTAND_LIVE_TRADING_RISK")
-        if os.getenv("SYSTEM_MODE", "").lower() != "live":
-            raise RuntimeError("live mode requires SYSTEM_MODE=live in .env")
+        if os.getenv("SYSTEM_MODE", "").lower() not in {"micro_live", "live"}:
+            raise RuntimeError("live-capable mode requires SYSTEM_MODE=micro_live or SYSTEM_MODE=live in .env")
+        expected_account_id = account.get("expected_account_id")
+        if expected_account_id is not None and str(expected_account_id) != _env_first("ACCOUNT_ID", "MT5_LOGIN"):
+            raise RuntimeError("live mode account ID does not match account.expected_account_id")
+        expected_server = account.get("expected_server")
+        if expected_server is not None and str(expected_server) != _env_first("SERVER_NAME", "MT5_SERVER"):
+            raise RuntimeError("live mode server does not match account.expected_server")
+        if str(risk.get("profile", "")).lower() in {"research", "paper"}:
+            raise RuntimeError("live mode requires a non-research risk profile")
+        emergency_stop_file = risk.get("emergency_stop_file")
+        if emergency_stop_file and Path(emergency_stop_file).exists():
+            raise RuntimeError("live mode blocked by emergency stop file")
+
+    def _reconcile_startup(self, symbol_name: str, open_positions: int) -> dict[str, object]:
+        max_allowed = int(self.config.raw.get("risk", {}).get("max_open_positions", 1))
+        if self.config.mode in {"micro_live", "live"} and open_positions and not self.config.raw.get("execution", {}).get("allow_existing_positions", False):
+            return {
+                "event": "startup_reconciliation",
+                "symbol": symbol_name,
+                "broker_open_positions": open_positions,
+                "local_open_positions": 0,
+                "status": "blocked",
+                "severity": "CRITICAL",
+                "reason": "broker_positions_require_manual_review",
+            }
+        return {
+            "event": "startup_reconciliation",
+            "symbol": symbol_name,
+            "broker_open_positions": open_positions,
+            "local_open_positions": 0,
+            "status": "passed" if open_positions <= max_allowed else "blocked",
+            "severity": "INFO" if open_positions <= max_allowed else "CRITICAL",
+        }
 
     def _paper_order_record(self, decision, magic: int, run_id: str) -> dict[str, object]:
         order = self._order_request(decision, magic, run_id, "paper")
@@ -154,3 +208,11 @@ class RealtimeRunner:
             magic=magic,
             comment=f"algo_trade:{mode}:{run_id}",
         )
+
+
+def _env_first(*names: str) -> str | None:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return None

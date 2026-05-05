@@ -25,7 +25,18 @@ FEATURE_SCHEMA = [
 
 
 def build_features(frame: pd.DataFrame) -> FeatureFrame:
-    data = frame.copy()
+    if {"symbol", "timeframe"}.issubset(frame.columns):
+        pieces = []
+        for _, group in frame.groupby(["symbol", "timeframe"], sort=False):
+            pieces.append(_build_features_single(group.copy()))
+        data = pd.concat(pieces).sort_index()
+    else:
+        data = _build_features_single(frame.copy())
+    data[FEATURE_SCHEMA] = data[FEATURE_SCHEMA].replace([np.inf, -np.inf], np.nan)
+    return FeatureFrame(data=data, feature_schema_version=FEATURE_SCHEMA_VERSION, schema=FEATURE_SCHEMA.copy())
+
+
+def _build_features_single(data: pd.DataFrame) -> pd.DataFrame:
     data["return"] = data["close"].pct_change()
     data["log_return"] = np.log(data["close"] / data["close"].shift(1))
     data["atr"] = atr(data)
@@ -41,8 +52,7 @@ def build_features(frame: pd.DataFrame) -> FeatureFrame:
     data["bb_lower"] = rolling_mean - 2 * rolling_std
     data["rolling_high"] = data["high"].rolling(5, min_periods=2).max().shift(1)
     data["rolling_low"] = data["low"].rolling(5, min_periods=2).min().shift(1)
-    data[FEATURE_SCHEMA] = data[FEATURE_SCHEMA].replace([np.inf, -np.inf], np.nan)
-    return FeatureFrame(data=data, feature_schema_version=FEATURE_SCHEMA_VERSION, schema=FEATURE_SCHEMA.copy())
+    return data
 
 
 def validate_feature_schema(feature_frame: FeatureFrame, expected_schema: list[str] | None = None) -> None:

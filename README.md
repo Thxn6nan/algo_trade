@@ -8,22 +8,25 @@ The project currently implements a **Python modular CLI** for **Backtest, Shadow
 
 In scope now:
 
-- Historical OHLCV data loading from CSV
+- Historical OHLCV data loading from real CSV, with sample fixtures disabled by default
+- MT5 backfill when historical data is missing or below the configured evidence threshold
 - Real MT5 bar reads for paper/live runs
 - Market data validation
 - Technical feature pipeline
-- Feature schema lock
+- Feature schema lock with per-symbol/timeframe rolling calculations
 - Baseline strategies
+- Model-probability strategy adapter
 - Signal generation
 - Signal filters
 - Risk-controlled trade decisions
 - Stateful backtesting with TP/SL/time stop
 - Realistic cost hooks for spread, slippage, and commission
-- JSONL and SQLite logs
+- JSONL and SQLite logs with common structured fields
 - Performance reporting
+- Edge evidence gate with real-data, sample-rejection, baseline, and slippage-stress checks
 - Shadow-mode safety shell with order submission disabled
 - Paper-mode decision/order logging without broker submission
-- Live-mode MT5 order submission behind explicit config and `.env` guards
+- Micro-live/live MT5 order submission behind explicit config, account/server, reconciliation, emergency-stop, and `.env` guards
 
 Out of scope for the current phase:
 
@@ -43,11 +46,14 @@ backtest
 walk_forward
 shadow
 paper
+micro_live
 live
 ```
 
 Backtest safety defaults:
 
+- Backtests require real data by default and will not silently use `sample_*.csv` fixtures.
+- If local real data is missing or too small, the system attempts MT5 backfill according to `data.auto_fetch_latest`.
 - Signals generated on candle `t` execute at the next candle open.
 - Same-bar TP/SL ambiguity uses the conservative policy: stop loss first.
 - Every approved entry decision must have a stop loss.
@@ -71,6 +77,7 @@ config/default.yaml  Default runnable config
 data/                Sample historical data
 runs/                Generated run logs and SQLite state
 tests/               Unit tests
+tradingview/         Pine Script indicator mirrors for visual research
 run.py               CLI entrypoint
 SPEC.md             System specification
 BASICCONCEPT.md     Trading concept notes
@@ -92,11 +99,13 @@ Run the test suite:
 python -m unittest discover -s tests -v
 ```
 
-Run a sample backtest:
+Run a real-data evidence backtest:
 
 ```bash
 python run.py --mode backtest --symbol XAUUSDm --timeframe M15
 ```
+
+The command prints `edge_evidence.verdict`. `FAIL` is a valid and important outcome: it means the current strategy did not prove an edge under the configured gates.
 
 Run shadow safety mode:
 
@@ -110,9 +119,19 @@ Run one paper cycle against MT5 data:
 python run.py --mode paper --symbol XAUUSDm --timeframe M15
 ```
 
-Live mode uses the same command shape, but only after the live guards in `config/default.yaml` and `.env` are deliberately enabled.
+Micro-live/live mode uses the same command shape, but only after the live guards in `config/default.yaml` and `.env` are deliberately enabled.
 
 Outputs are written under `runs/<run_id>/`.
+
+## TradingView Mirror
+
+The TradingView indicator mirror lives at:
+
+```text
+tradingview/algo_trade_edge_indicator.pine
+```
+
+It mirrors the current Python signal/filter timing visually: candle-close signal, next-bar execution marker, and ATR-based SL/TP levels. It does not replace the Python live engine, risk sizing, broker reconciliation, data validation, or edge evidence gate.
 
 ## Configuration
 
@@ -127,6 +146,8 @@ Important groups:
 - `mode`: selected operating mode
 - `paths`: data and output directories
 - `symbols`: enabled symbols and symbol metadata
+- `data`: real-data requirements, sample-data policy, MT5 backfill size, and missing-bar policy
+- `edge`: evidence thresholds, baseline checks, and stress scenarios
 - `risk`: risk caps, max lot, kill-switch behavior
 - `signal`: strategy and thresholds
 - `filters`: spread and volatility filters

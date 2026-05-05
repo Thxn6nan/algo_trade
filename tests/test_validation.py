@@ -18,9 +18,13 @@ def valid_frame() -> pd.DataFrame:
 
 class DataValidationTest(unittest.TestCase):
     def test_valid_data_returns_quality_report(self):
-        report = validate_ohlcv(valid_frame())
+        report = validate_ohlcv(valid_frame(), source="unit_test")
         self.assertEqual(report.duplicate_timestamps, 0)
         self.assertEqual(report.invalid_candles, 0)
+        self.assertEqual(report.nan_count, 0)
+        self.assertEqual(report.infinite_count, 0)
+        self.assertEqual(report.source, "unit_test")
+        self.assertEqual(report.validation_status, "passed")
 
     def test_missing_columns_fail(self):
         frame = valid_frame().drop(columns=["spread"])
@@ -39,6 +43,15 @@ class DataValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Duplicate timestamps"):
             validate_ohlcv(frame)
 
+    def test_same_timestamp_across_symbols_is_allowed(self):
+        frame = valid_frame()
+        other = valid_frame()
+        other["symbol"] = "EURUSDm"
+        combined = pd.concat([frame, other], ignore_index=True)
+        report = validate_ohlcv(combined)
+        self.assertEqual(report.duplicate_timestamps, 0)
+        self.assertEqual(report.symbol, "XAUUSDm,EURUSDm")
+
     def test_unsorted_timestamp_fails(self):
         frame = valid_frame().iloc[[1, 0, 2]].reset_index(drop=True)
         with self.assertRaisesRegex(ValueError, "sorted ascending"):
@@ -48,6 +61,12 @@ class DataValidationTest(unittest.TestCase):
         frame = valid_frame()
         frame.loc[0, "spread"] = -1
         with self.assertRaisesRegex(ValueError, "Invalid candles"):
+            validate_ohlcv(frame)
+
+    def test_infinite_numeric_value_fails(self):
+        frame = valid_frame()
+        frame.loc[0, "close"] = float("inf")
+        with self.assertRaisesRegex(ValueError, "infinite values"):
             validate_ohlcv(frame)
 
     def test_market_session_gap_can_be_allowed(self):

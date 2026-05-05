@@ -6,7 +6,8 @@ from pathlib import Path
 
 from algo_trade.backtest import BacktestEngine
 from algo_trade.config import load_config, with_mode
-from algo_trade.data import HistoricalDataProvider
+from algo_trade.data import load_backtest_data
+from algo_trade.edge import build_edge_evidence
 from algo_trade.mt5_gateway import MT5Gateway
 from algo_trade.realtime import RealtimeRunner
 from algo_trade.shadow import ShadowRunner
@@ -17,7 +18,7 @@ from algo_trade.symbols import SymbolRegistry
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Algorithmic trading core CLI")
     parser.add_argument("--config", default="config/default.yaml", help="Path to YAML config")
-    parser.add_argument("--mode", choices=["research", "backtest", "walk_forward", "shadow", "paper", "live"], help="Override config mode")
+    parser.add_argument("--mode", choices=["research", "backtest", "walk_forward", "shadow", "paper", "micro_live", "live"], help="Override config mode")
     parser.add_argument("--symbol", help="Symbol to run")
     parser.add_argument("--timeframe", default="M15", help="Primary timeframe")
     return parser
@@ -33,10 +34,21 @@ def main(argv: list[str] | None = None) -> int:
     strategy = get_strategy(config.raw["signal"].get("strategy", "atr_breakout"))
 
     if config.mode in {"backtest", "walk_forward", "research"}:
-        provider = HistoricalDataProvider(config.data_dir)
-        frame = provider.load(symbol, args.timeframe)
+        frame = load_backtest_data(config, symbol, args.timeframe)
         result = BacktestEngine(config, registry, strategy).run(frame, symbol)
-        print(json.dumps({"run_id": result.run_id, "run_dir": str(result.run_dir), "report": result.report.to_record()}, indent=2, default=str))
+        edge_evidence = build_edge_evidence(config, registry, frame, symbol, strategy, result)
+        print(
+            json.dumps(
+                {
+                    "run_id": result.run_id,
+                    "run_dir": str(result.run_dir),
+                    "report": result.report.to_record(),
+                    "edge_evidence": edge_evidence.to_record(),
+                },
+                indent=2,
+                default=str,
+            )
+        )
         return 0
 
     if config.mode == "shadow":
@@ -44,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"run_id": run_id, "mode": "shadow", "send_orders": False}, indent=2))
         return 0
 
-    if config.mode in {"paper", "live"}:
+    if config.mode in {"paper", "micro_live", "live"}:
         gateway = MT5Gateway(env_path=config.raw["execution"].get("env_path", ".env"))
         result = RealtimeRunner(config, registry, strategy, gateway).run_once(symbol, args.timeframe)
         print(json.dumps(result.__dict__, indent=2, default=str))
