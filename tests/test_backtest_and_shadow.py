@@ -46,6 +46,22 @@ class FakeGateway:
     def latest_bars(self, symbol: str, timeframe: str, count: int = 250, include_current: bool = False) -> pd.DataFrame:
         return load_sample().tail(count).reset_index(drop=True)
 
+    def symbol_metadata(self, symbol: str) -> dict[str, object]:
+        return {
+            "symbol": symbol,
+            "point": 0.01,
+            "digits": 2,
+            "spread": 160,
+            "tick_size": 0.01,
+            "tick_value": 1.0,
+            "contract_size": 100,
+            "trade_tick_size": 0.01,
+            "trade_tick_value": 1.0,
+            "volume_min": 0.01,
+            "volume_max": 1.0,
+            "volume_step": 0.01,
+        }
+
     def current_price(self, symbol: str, side: SignalSide) -> float:
         return 100.0
 
@@ -192,6 +208,39 @@ class BacktestAndShadowTest(unittest.TestCase):
             self.assertFalse(frame.attrs["is_sample_data"])
             self.assertTrue((Path(temp_dir) / "XAUUSDm_M15.csv").exists())
             self.assertTrue(gateway.shutdown_called)
+
+    def test_backtest_data_attaches_broker_symbol_metadata_from_gateway(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            shutil.copy("data/sample_XAUUSDm_M15.csv", Path(temp_dir) / "XAUUSDm_M15.csv")
+            config = load_config("config/default.yaml")
+            config.raw["paths"]["data_dir"] = temp_dir
+            config.raw["data"].update(
+                {
+                    "allow_sample_data": False,
+                    "require_real_data": True,
+                    "auto_fetch_latest": False,
+                    "min_bars": 10,
+                }
+            )
+            frame = load_backtest_data(config, "XAUUSDm", "M15", gateway=FakeGateway())
+
+            self.assertEqual(frame.attrs["broker_metadata"]["trade_tick_value"], 1.0)
+
+    def test_backtest_persists_broker_symbol_metadata_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config("config/default.yaml")
+            config.raw["paths"]["output_dir"] = temp_dir
+            config.raw["data"].update({"allow_sample_data": True, "require_real_data": False, "min_bars": 1})
+            registry = SymbolRegistry.from_config(config.raw["symbols"])
+            frame = load_sample()
+            frame.attrs["broker_metadata"] = FakeGateway().symbol_metadata("XAUUSDm")
+
+            result = BacktestEngine(config, registry, AlwaysBuyStrategy()).run(frame, "XAUUSDm")
+
+            snapshot_path = Path(result.run_dir) / "broker_symbol_metadata.json"
+            self.assertTrue(snapshot_path.exists())
+            self.assertTrue(result.symbol_audit.broker_metadata_confirmed)
+            self.assertEqual(json.loads(snapshot_path.read_text(encoding="utf-8"))["symbol"], "XAUUSDm")
 
     def test_paper_mode_records_real_data_decision_without_sending_order(self):
         with tempfile.TemporaryDirectory() as temp_dir:

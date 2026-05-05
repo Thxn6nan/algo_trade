@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import pandas as pd
@@ -100,6 +101,41 @@ class RealEdgeRoadmapTest(unittest.TestCase):
         self.assertFalse(audit.broker_metadata_confirmed)
         self.assertIn("broker_metadata_unconfirmed", audit.promotion_blockers)
         self.assertIn("spread_config_mismatch", audit.promotion_blockers)
+
+    def test_symbol_audit_requires_matching_broker_metadata_before_confirming(self):
+        matching_metadata = {
+            "point": 0.01,
+            "digits": 2,
+            "spread": 160,
+            "tick_size": 0.01,
+            "tick_value": 1.0,
+            "contract_size": 100,
+            "trade_tick_size": 0.01,
+            "trade_tick_value": 1.0,
+            "volume_min": 0.01,
+            "volume_max": 1.0,
+            "volume_step": 0.01,
+        }
+
+        metadata_symbol = replace(symbol(), average_spread=160, tick_size=0.01, tick_value=1.0)
+
+        confirmed = build_symbol_audit(
+            market_frame(),
+            metadata_symbol,
+            timestamp_semantics="candle_open_time",
+            broker_metadata=matching_metadata,
+        )
+        mismatched = build_symbol_audit(
+            market_frame(),
+            metadata_symbol,
+            timestamp_semantics="candle_open_time",
+            broker_metadata={**matching_metadata, "trade_tick_value": 10.0},
+        )
+
+        self.assertTrue(confirmed.broker_metadata_confirmed)
+        self.assertNotIn("broker_metadata_unconfirmed", confirmed.promotion_blockers)
+        self.assertFalse(mismatched.broker_metadata_confirmed)
+        self.assertIn("broker_metadata_mismatch", mismatched.promotion_blockers)
 
     def test_strategy_viability_classifies_high_rejection_rate_as_invalid_configuration(self):
         signals = [

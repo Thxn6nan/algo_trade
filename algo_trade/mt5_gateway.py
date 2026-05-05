@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import pandas as pd
@@ -112,6 +112,33 @@ class MT5Gateway:
         if account is None:
             raise RuntimeError(f"MT5 returned no account info: {self.mt5.last_error()}")
         return float(account.equity)
+
+    def symbol_metadata(self, symbol: str) -> dict[str, Any]:
+        self.initialize()
+        self._ensure_symbol(symbol)
+        info = self.mt5.symbol_info(symbol)
+        if info is None:
+            raise RuntimeError(f"MT5 returned no symbol info for {symbol}: {self.mt5.last_error()}")
+        raw = info._asdict() if hasattr(info, "_asdict") else dict(info)
+        trade_tick_size = raw.get("trade_tick_size")
+        trade_tick_value = raw.get("trade_tick_value")
+        return {
+            "captured_at": datetime.now(UTC).isoformat(),
+            "symbol": symbol,
+            "name": raw.get("name", symbol),
+            "point": raw.get("point"),
+            "digits": raw.get("digits"),
+            "spread": raw.get("spread"),
+            "tick_size": raw.get("tick_size", trade_tick_size),
+            "tick_value": raw.get("tick_value", trade_tick_value),
+            "contract_size": raw.get("contract_size", raw.get("trade_contract_size")),
+            "trade_tick_size": trade_tick_size,
+            "trade_tick_value": trade_tick_value,
+            "volume_min": raw.get("volume_min"),
+            "volume_max": raw.get("volume_max"),
+            "volume_step": raw.get("volume_step"),
+            "raw": raw,
+        }
 
     def open_positions_count(self, symbol: str) -> int:
         self.initialize()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -66,6 +67,8 @@ class BacktestEngine:
         data = feature_frame.data
         data["feature_schema_version"] = feature_frame.feature_schema_version
         symbol = self.registry.get(symbol_name)
+        run_id = f"bt-{uuid.uuid4().hex[:12]}"
+        run_dir = self.config.output_dir / run_id
         symbol_audit = build_symbol_audit(
             frame,
             symbol,
@@ -76,8 +79,7 @@ class BacktestEngine:
             ),
             require_broker_metadata=bool(self.config.raw.get("symbol_audit", {}).get("require_broker_metadata", True)),
         )
-        run_id = f"bt-{uuid.uuid4().hex[:12]}"
-        run_dir = self.config.output_dir / run_id
+        self._persist_broker_metadata_snapshot(frame, run_dir)
         recorder = (
             RunRecorder(run_id, run_dir, mode=self.config.mode, config_hash=self.config.config_hash)
             if self.record_events
@@ -94,6 +96,12 @@ class BacktestEngine:
             recorder.record("system_events", "runs", metadata.to_record())
             recorder.record("system_events", "system_events", {"event": "data_quality", **quality.to_record()})
             recorder.record("system_events", "system_events", {"event": "symbol_audit", **symbol_audit.to_record()})
+            if frame.attrs.get("broker_metadata"):
+                recorder.record(
+                    "system_events",
+                    "system_events",
+                    {"event": "broker_symbol_metadata", **frame.attrs["broker_metadata"]},
+                )
             recorder.record("system_events", "config_versions", {"config_hash": self.config.config_hash, "config": self.config.raw})
             recorder.record("system_events", "symbol_registry_snapshots", {"symbols": self.config.raw["symbols"]})
 
@@ -253,6 +261,25 @@ class BacktestEngine:
             symbol_audit=symbol_audit,
             strategy_viability=viability,
         )
+
+    def _persist_broker_metadata_snapshot(self, frame: pd.DataFrame, run_dir: Path) -> None:
+        if not self.record_events:
+            return
+        metadata = frame.attrs.get("broker_metadata")
+        error = frame.attrs.get("broker_metadata_error")
+        if not metadata and not error:
+            return
+        run_dir.mkdir(parents=True, exist_ok=True)
+        if metadata:
+            (run_dir / "broker_symbol_metadata.json").write_text(
+                json.dumps(metadata, indent=2, sort_keys=True, default=str),
+                encoding="utf-8",
+            )
+        if error:
+            (run_dir / "broker_symbol_metadata_error.json").write_text(
+                json.dumps({"error": str(error)}, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
 
     def _maybe_close(self, position: Position, row: pd.Series, symbol: SymbolSpec, equity: float) -> Trade | None:
         position.holding_bars += 1

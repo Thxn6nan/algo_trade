@@ -62,6 +62,9 @@ class MT5MarketDataProvider:
     def latest_bars(self, symbol: str, timeframe: str, count: int = 250, include_current: bool = False) -> pd.DataFrame:
         return self.gateway.latest_bars(symbol, timeframe, count=count, include_current=include_current)
 
+    def symbol_metadata(self, symbol: str) -> dict[str, Any]:
+        return self.gateway.symbol_metadata(symbol)
+
     def close(self) -> None:
         shutdown = getattr(self.gateway, "shutdown", None)
         if callable(shutdown):
@@ -94,6 +97,7 @@ def load_backtest_data(config: Any, symbol: str, timeframe: str, gateway: Any | 
         )
     if require_real_data and bool(frame.attrs.get("is_sample_data", False)):
         raise ValueError("Sample data cannot be used for evidence backtests when data.require_real_data=true")
+    _attach_broker_metadata(frame, config, symbol, gateway)
     return frame
 
 
@@ -110,6 +114,7 @@ def _fetch_and_persist(
     market_data = MT5MarketDataProvider(gateway=gateway, env_path=config.raw.get("execution", {}).get("env_path", ".env"))
     try:
         frame = market_data.latest_bars(symbol, timeframe, count=bars, include_current=False)
+        _try_attach_metadata_from_provider(frame, symbol, market_data)
     except Exception as exc:
         raise RuntimeError(
             f"Real historical data is missing/incomplete and MT5 backfill failed for {symbol} {timeframe}. "
@@ -122,3 +127,40 @@ def _fetch_and_persist(
     frame.attrs["is_sample_data"] = False
     frame.attrs["fetched_from"] = "mt5"
     return frame
+
+
+def _attach_broker_metadata(frame: pd.DataFrame, config: Any, symbol: str, gateway: Any | None) -> None:
+    if frame.attrs.get("broker_metadata"):
+        return
+    if not bool(config.raw.get("symbol_audit", {}).get("require_broker_metadata", True)):
+        return
+    if gateway is not None:
+        _try_attach_metadata_from_gateway(frame, symbol, gateway)
+        return
+    if not bool(config.raw.get("data", {}).get("auto_fetch_latest", False)):
+        return
+
+    try:
+        market_data = MT5MarketDataProvider(env_path=config.raw.get("execution", {}).get("env_path", ".env"))
+    except Exception as exc:
+        frame.attrs["broker_metadata_error"] = str(exc)
+        return
+    try:
+        _try_attach_metadata_from_provider(frame, symbol, market_data)
+    finally:
+        market_data.close()
+
+
+def _try_attach_metadata_from_provider(frame: pd.DataFrame, symbol: str, provider: MT5MarketDataProvider) -> None:
+    _try_attach_metadata_from_gateway(frame, symbol, provider)
+
+
+def _try_attach_metadata_from_gateway(frame: pd.DataFrame, symbol: str, gateway: Any) -> None:
+    metadata = getattr(gateway, "symbol_metadata", None)
+    if not callable(metadata):
+        frame.attrs["broker_metadata_error"] = "Gateway does not expose symbol_metadata"
+        return
+    try:
+        frame.attrs["broker_metadata"] = metadata(symbol)
+    except Exception as exc:
+        frame.attrs["broker_metadata_error"] = str(exc)
