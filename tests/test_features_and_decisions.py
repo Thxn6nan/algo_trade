@@ -126,6 +126,47 @@ class FeatureAndDecisionTest(unittest.TestCase):
         self.assertEqual(decision.status, DecisionStatus.REJECTED)
         self.assertIn("spread_too_high", decision.reasons)
 
+    def test_daily_loss_limit_resets_on_new_signal_day(self):
+        risk = RiskEngine(
+            {"risk_per_trade": 0.0025, "daily_loss_limit": 0.01, "max_drawdown": 0.5, "max_open_positions": 2, "max_lot": 0.10},
+            10000,
+        )
+
+        breached = risk.snapshot(9899, timestamp=pd.Timestamp("2026-01-01T15:00:00").to_pydatetime())
+        next_day = risk.snapshot(9899, timestamp=pd.Timestamp("2026-01-02T00:00:00").to_pydatetime())
+
+        self.assertTrue(breached.kill_switch_active)
+        self.assertEqual(breached.kill_switch_reason, "daily_loss_limit_breached")
+        self.assertFalse(next_day.kill_switch_active)
+        self.assertEqual(next_day.daily_loss, 0.0)
+
+    def test_max_drawdown_kill_switch_does_not_reset_on_new_day(self):
+        risk = RiskEngine(
+            {"risk_per_trade": 0.0025, "daily_loss_limit": 0.01, "max_drawdown": 0.1, "max_open_positions": 2, "max_lot": 0.10},
+            10000,
+        )
+
+        breached = risk.snapshot(8900, timestamp=pd.Timestamp("2026-01-01T15:00:00").to_pydatetime())
+        next_day = risk.snapshot(8900, timestamp=pd.Timestamp("2026-01-02T00:00:00").to_pydatetime())
+
+        self.assertTrue(breached.kill_switch_active)
+        self.assertEqual(breached.kill_switch_reason, "max_drawdown_breached")
+        self.assertTrue(next_day.kill_switch_active)
+        self.assertEqual(next_day.kill_switch_reason, "max_drawdown_breached")
+
+    def test_daily_loss_limit_uses_day_start_equity_as_percent_anchor(self):
+        risk = RiskEngine(
+            {"risk_per_trade": 0.0025, "daily_loss_limit": 0.01, "max_drawdown": 0.5, "max_open_positions": 2, "max_lot": 0.10},
+            10000,
+        )
+
+        risk.snapshot(10000, timestamp=pd.Timestamp("2026-01-01T15:00:00").to_pydatetime())
+        risk.snapshot(20000, timestamp=pd.Timestamp("2026-01-02T00:00:00").to_pydatetime())
+        intraday_pullback = risk.snapshot(19850, timestamp=pd.Timestamp("2026-01-02T12:00:00").to_pydatetime())
+
+        self.assertFalse(intraday_pullback.kill_switch_active)
+        self.assertEqual(intraday_pullback.daily_loss, 150)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime
 
 from algo_trade.symbols import SymbolSpec
 from algo_trade.types import RiskSnapshot
@@ -19,17 +20,36 @@ class RiskEngine:
         self.config = config
         self.initial_equity = initial_equity
         self.peak_equity = initial_equity
+        self.loss_period_date: date | None = None
+        self.day_start_equity = initial_equity
         self.kill_switch_active = False
         self.kill_switch_reason: str | None = None
 
-    def snapshot(self, equity: float, open_risk: float = 0.0) -> RiskSnapshot:
+    def snapshot(self, equity: float, open_risk: float = 0.0, timestamp: datetime | None = None) -> RiskSnapshot:
+        if timestamp is not None:
+            current_date = timestamp.date()
+            if self.loss_period_date is None:
+                self.loss_period_date = current_date
+            elif current_date != self.loss_period_date:
+                self.loss_period_date = current_date
+                self.day_start_equity = equity
+                if self.kill_switch_reason == "daily_loss_limit_breached":
+                    self.kill_switch_active = False
+                    self.kill_switch_reason = None
+
         self.peak_equity = max(self.peak_equity, equity)
         drawdown = 0.0 if self.peak_equity == 0 else (self.peak_equity - equity) / self.peak_equity
         if drawdown >= float(self.config.get("max_drawdown", 1.0)):
             self.kill_switch_active = True
             self.kill_switch_reason = "max_drawdown_breached"
-        daily_loss = max(0.0, self.initial_equity - equity)
-        if daily_loss / self.initial_equity >= float(self.config.get("daily_loss_limit", 1.0)):
+
+        loss_anchor = self.day_start_equity if timestamp is not None else self.initial_equity
+        daily_loss = max(0.0, loss_anchor - equity)
+        daily_loss_base = loss_anchor if loss_anchor > 0 else self.initial_equity
+        if (
+            self.kill_switch_reason != "max_drawdown_breached"
+            and daily_loss / daily_loss_base >= float(self.config.get("daily_loss_limit", 1.0))
+        ):
             self.kill_switch_active = True
             self.kill_switch_reason = "daily_loss_limit_breached"
         return RiskSnapshot(

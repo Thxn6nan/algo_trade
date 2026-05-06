@@ -20,7 +20,7 @@ class DecisionEngine:
         entry_price: float,
         open_positions: int,
     ) -> TradeDecision:
-        snapshot = self.risk.snapshot(equity)
+        snapshot = self.risk.snapshot(equity, timestamp=signal.timestamp)
         if snapshot.kill_switch_active:
             return _decision(signal, DecisionType.HALT, DecisionStatus.HALTED, None, None, None, 0.0, 0.0, ["kill_switch_active", snapshot.kill_switch_reason or "unknown"])
 
