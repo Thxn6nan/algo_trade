@@ -126,6 +126,46 @@ class FeatureAndDecisionTest(unittest.TestCase):
         self.assertEqual(decision.status, DecisionStatus.REJECTED)
         self.assertIn("spread_too_high", decision.reasons)
 
+    def test_default_decision_engine_enforces_risk_halts(self):
+        signal = Signal(
+            timestamp=pd.Timestamp("2026-01-01T15:00:00").to_pydatetime(),
+            symbol="XAUUSDm",
+            side=SignalSide.BUY,
+            confidence=0.8,
+            expected_return=0.01,
+            source="test",
+            timeframe="M15",
+            metadata={"atr": 1.0, "spread": 18},
+        )
+        decision = DecisionEngine(
+            SignalFilter({"buy_threshold": 0.6, "sell_threshold": 0.6, "min_rr": 1.5}, {"max_spread_multiplier": 2.5}),
+            RiskEngine({"risk_per_trade": 0.0025, "daily_loss_limit": 0.01, "max_drawdown": 0.5, "max_open_positions": 2, "max_lot": 0.10}, 10000),
+            {},
+        ).decide(signal, symbol(), equity=9899, entry_price=100.0, open_positions=0)
+
+        self.assertEqual(decision.status, DecisionStatus.HALTED)
+        self.assertIn("daily_loss_limit_breached", decision.reasons)
+
+    def test_research_decision_engine_can_audit_risk_halts_without_enforcing_them(self):
+        signal = Signal(
+            timestamp=pd.Timestamp("2026-01-01T15:00:00").to_pydatetime(),
+            symbol="XAUUSDm",
+            side=SignalSide.BUY,
+            confidence=0.8,
+            expected_return=0.01,
+            source="test",
+            timeframe="M15",
+            metadata={"atr": 1.0, "spread": 18},
+        )
+        decision = DecisionEngine(
+            SignalFilter({"buy_threshold": 0.6, "sell_threshold": 0.6, "min_rr": 1.5}, {"max_spread_multiplier": 2.5}),
+            RiskEngine({"risk_per_trade": 0.0025, "daily_loss_limit": 0.01, "max_drawdown": 0.5, "max_open_positions": 2, "max_lot": 0.10}, 10000),
+            {"enforce_risk_halts": False},
+        ).decide(signal, symbol(), equity=9899, entry_price=100.0, open_positions=0)
+
+        self.assertEqual(decision.status, DecisionStatus.APPROVED)
+        self.assertIn("risk_sized", decision.reasons)
+
     def test_daily_loss_limit_resets_on_new_signal_day(self):
         risk = RiskEngine(
             {"risk_per_trade": 0.0025, "daily_loss_limit": 0.01, "max_drawdown": 0.5, "max_open_positions": 2, "max_lot": 0.10},

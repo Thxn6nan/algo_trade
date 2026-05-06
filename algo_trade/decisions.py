@@ -21,7 +21,8 @@ class DecisionEngine:
         open_positions: int,
     ) -> TradeDecision:
         snapshot = self.risk.snapshot(equity, timestamp=signal.timestamp)
-        if snapshot.kill_switch_active:
+        enforce_risk_halts = bool(self.backtest_config.get("enforce_risk_halts", True))
+        if snapshot.kill_switch_active and enforce_risk_halts:
             return _decision(signal, DecisionType.HALT, DecisionStatus.HALTED, None, None, None, 0.0, 0.0, ["kill_switch_active", snapshot.kill_switch_reason or "unknown"])
 
         if signal.side == SignalSide.HOLD:
