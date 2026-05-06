@@ -103,7 +103,7 @@ def build_edge_evidence(
 
     evidence = _assess(config, frame, primary_result, baseline_reports, stress_reports, wf_summary, robustness)
     _record_edge(config, primary_result.run_id, primary_result.run_dir, evidence)
-    _record_report(config, primary_result, evidence, robustness)
+    _record_report(config, frame, primary_result, evidence, robustness)
     return evidence
 
 
@@ -234,7 +234,7 @@ def _record_edge(config: AppConfig, run_id: str, run_dir: Path, evidence: EdgeEv
         recorder.close()
 
 
-def _record_report(config: AppConfig, result: BacktestResult, evidence: EdgeEvidence, robustness_summary: Any) -> None:
+def _record_report(config: AppConfig, frame: pd.DataFrame, result: BacktestResult, evidence: EdgeEvidence, robustness_summary: Any) -> None:
     if config.raw.get("reports", {}).get("edge_report", True) is False:
         return
     data_quality = result.data_quality.to_record() if result.data_quality and hasattr(result.data_quality, "to_record") else {}
@@ -249,6 +249,12 @@ def _record_report(config: AppConfig, result: BacktestResult, evidence: EdgeEvid
             "strategy_configuration": config.raw.get("signal", {}),
             "strategy_viability": evidence.strategy_viability,
             "edge_evidence": evidence.to_record(),
+            "execution_diagnostics": build_execution_diagnostics(
+                frame,
+                result.trades,
+                result.report.to_record(),
+                config.raw.get("risk", {}),
+            ),
             "baseline_comparison": evidence.baseline_metrics,
             "performance": result.report.to_record(),
             "trades": [trade.to_record() for trade in result.trades],
@@ -271,6 +277,48 @@ def _research_candidate_gate(config: AppConfig, result: BacktestResult, evidence
         "minimum_trades": result.report.number_of_trades >= min_trades,
     }
     return {"gate": "research_candidate", "passed": all(checks.values()), "checks": checks}
+
+
+def build_execution_diagnostics(
+    frame: pd.DataFrame,
+    trades: list[object],
+    primary_metrics: dict[str, object],
+    risk_config: dict[str, object],
+) -> dict[str, object]:
+    timestamps = pd.to_datetime(frame["timestamp"]) if "timestamp" in frame and len(frame) else pd.Series(dtype="datetime64[ns]")
+    data_start = timestamps.min() if len(timestamps) else pd.NaT
+    data_end = timestamps.max() if len(timestamps) else pd.NaT
+    data_seconds = float((data_end - data_start).total_seconds()) if pd.notna(data_start) and pd.notna(data_end) else 0.0
+
+    first_entry = min((pd.Timestamp(getattr(trade, "entry_time")) for trade in trades), default=pd.NaT)
+    last_exit = max((pd.Timestamp(getattr(trade, "exit_time")) for trade in trades), default=pd.NaT)
+    trade_seconds = float((last_exit - first_entry).total_seconds()) if pd.notna(first_entry) and pd.notna(last_exit) else 0.0
+    remaining_seconds = float((data_end - last_exit).total_seconds()) if pd.notna(data_end) and pd.notna(last_exit) else 0.0
+
+    max_drawdown = float(primary_metrics.get("max_drawdown", 0.0) or 0.0)
+    drawdown_cap = float(risk_config.get("max_drawdown", 1.0) or 1.0)
+    risk_cap_reached = drawdown_cap < 1.0 and max_drawdown >= drawdown_cap * 0.99
+    data_remaining_after_last_trade_ratio = remaining_seconds / data_seconds if data_seconds > 0 else 0.0
+    trade_period_coverage_ratio = trade_seconds / data_seconds if data_seconds > 0 else 0.0
+
+    flags = []
+    if not trades:
+        flags.append("no_trades")
+    if trades and risk_cap_reached and data_remaining_after_last_trade_ratio > 0.5:
+        flags.append("trade_activity_truncated")
+
+    return {
+        "data_start": data_start.isoformat() if pd.notna(data_start) else None,
+        "data_end": data_end.isoformat() if pd.notna(data_end) else None,
+        "first_trade_entry": first_entry.isoformat() if pd.notna(first_entry) else None,
+        "last_trade_exit": last_exit.isoformat() if pd.notna(last_exit) else None,
+        "trade_period_coverage_ratio": trade_period_coverage_ratio,
+        "data_remaining_after_last_trade_ratio": data_remaining_after_last_trade_ratio,
+        "max_drawdown": max_drawdown,
+        "risk_max_drawdown": drawdown_cap,
+        "risk_cap_reached": risk_cap_reached,
+        "flags": flags,
+    }
 
 
 def _trade_distribution(trades: list[object]) -> dict[str, object]:

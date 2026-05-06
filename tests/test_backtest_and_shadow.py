@@ -12,12 +12,12 @@ import pandas as pd
 from algo_trade.backtest import BacktestEngine
 from algo_trade.config import load_config, validate_config, with_mode
 from algo_trade.data import HistoricalDataProvider, load_backtest_data
-from algo_trade.edge import build_edge_evidence
+from algo_trade.edge import build_edge_evidence, build_execution_diagnostics
 from algo_trade.execution import MT5ExecutionAdapter
 from algo_trade.realtime import RealtimeRunner
 from algo_trade.strategies import Strategy
 from algo_trade.symbols import SymbolRegistry
-from algo_trade.types import OrderRequest, Position, Signal, SignalSide, TradeState
+from algo_trade.types import OrderRequest, Position, Signal, SignalSide, Trade, TradeState
 
 
 class AlwaysBuyStrategy(Strategy):
@@ -103,6 +103,54 @@ def load_sample() -> pd.DataFrame:
 
 
 class BacktestAndShadowTest(unittest.TestCase):
+    def test_execution_diagnostics_flags_risk_truncated_backtests(self):
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-01-01", periods=100, freq="15min"),
+                "symbol": ["XAUUSDm"] * 100,
+                "timeframe": ["M15"] * 100,
+                "open": [100.0] * 100,
+                "high": [101.0] * 100,
+                "low": [99.0] * 100,
+                "close": [100.0] * 100,
+                "volume": [100] * 100,
+                "spread": [18] * 100,
+            }
+        )
+        trade = Trade(
+            trade_id="tr-test",
+            symbol="XAUUSDm",
+            side=SignalSide.BUY,
+            entry_time=pd.Timestamp("2026-01-01T00:15:00").to_pydatetime(),
+            entry_price=100.0,
+            exit_time=pd.Timestamp("2026-01-01T01:00:00").to_pydatetime(),
+            exit_price=99.0,
+            position_size=0.1,
+            stop_loss=99.0,
+            take_profit=102.0,
+            exit_reason=TradeState.POSITION_CLOSED_SL,
+            gross_pnl=-100.0,
+            net_pnl=-100.0,
+            commission=0.0,
+            spread_cost=0.0,
+            slippage=0.0,
+            r_multiple=-1.0,
+            holding_bars=3,
+            model_version="none",
+            config_hash="cfg",
+        )
+
+        diagnostics = build_execution_diagnostics(
+            frame,
+            [trade],
+            {"max_drawdown": 0.101},
+            {"max_drawdown": 0.10},
+        )
+
+        self.assertTrue(diagnostics["risk_cap_reached"])
+        self.assertIn("trade_activity_truncated", diagnostics["flags"])
+        self.assertGreater(diagnostics["data_remaining_after_last_trade_ratio"], 0.8)
+
     def test_backtest_generates_logs_and_report(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config = load_config("config/default.yaml")
